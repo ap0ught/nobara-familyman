@@ -3,6 +3,7 @@
 # Usage:  sudo ./setup.sh [--event 'button/power PBTN 00000080 00000000']
 #                         [--model mistral]  [--record-seconds 5]
 #                         [--mic-device hw:0,0] [--speaker-device hw:0,0]
+#                         [--llm-timeout 60]
 set -euo pipefail
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
@@ -11,6 +12,7 @@ MODEL_NAME="${MODEL_NAME:-mistral}"
 RECORD_SECONDS="${RECORD_SECONDS:-5}"
 MIC_DEVICE="${MIC_DEVICE:-default}"
 SPEAKER_DEVICE="${SPEAKER_DEVICE:-default}"
+LLM_TIMEOUT="${LLM_TIMEOUT:-60}"
 ACPI_EVENT_MATCH="button/power.*"
 LOGFILE="/var/log/nuc-voice-assistant.log"
 VOICE_DIR=""          # resolved after we know the real user
@@ -23,8 +25,37 @@ while [[ $# -gt 0 ]]; do
     --event)         ACPI_EVENT_MATCH="$2"; shift 2 ;;
     --model)         MODEL_NAME="$2"; shift 2 ;;
     --record-seconds) RECORD_SECONDS="$2"; shift 2 ;;
+    --llm-timeout)   LLM_TIMEOUT="$2"; shift 2 ;;
     --mic-device)    MIC_DEVICE="$2"; shift 2 ;;
     --speaker-device) SPEAKER_DEVICE="$2"; shift 2 ;;
+    --help|-h)
+      cat << 'HELPEOF'
+Usage: sudo ./setup.sh [OPTIONS]
+
+Idempotent NUC voice-assistant installer for Nobara HTPC.
+Re-running is safe — all steps are idempotent.
+
+Options:
+  --model NAME           Ollama model to pull and use            (default: mistral)
+  --record-seconds N     Seconds of audio to capture per press   (default: 5, max: 300)
+  --llm-timeout N        Seconds to wait for an LLM response     (default: 60)
+  --event 'STRING'       ACPI event match string                 (default: button/power.*)
+  --mic-device DEVICE    ALSA capture device, e.g. hw:1,0        (default: default)
+  --speaker-device DEV   ALSA playback device, e.g. hw:1,0       (default: default)
+  --help, -h             Show this help and exit
+
+Environment variables (override defaults before running):
+  MODEL_NAME, RECORD_SECONDS, LLM_TIMEOUT, MIC_DEVICE, SPEAKER_DEVICE
+  PIPER_VERSION   Piper release tag to download  (default: 2023.11.14-2)
+  PIPER_SHA256    Expected SHA-256 of the Piper tarball (recommended for security)
+
+Examples:
+  sudo ./setup.sh
+  sudo ./setup.sh --model llama3 --record-seconds 8
+  sudo ./setup.sh --event 'button/power PBTN 00000080 00000000'
+  PIPER_VERSION=2023.11.14-2 PIPER_SHA256=<hash> sudo ./setup.sh
+HELPEOF
+      exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -32,6 +63,10 @@ done
 # ─── Input validation ─────────────────────────────────────────────────────────
 if ! [[ "$RECORD_SECONDS" =~ ^[0-9]+$ ]] || [[ "$RECORD_SECONDS" -lt 1 ]] || [[ "$RECORD_SECONDS" -gt 300 ]]; then
   echo "Error: --record-seconds must be a positive integer between 1 and 300." >&2
+  exit 1
+fi
+if ! [[ "$LLM_TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$LLM_TIMEOUT" -lt 1 ]] || [[ "$LLM_TIMEOUT" -gt 3600 ]]; then
+  echo "Error: --llm-timeout must be a positive integer between 1 and 3600." >&2
   exit 1
 fi
 # Allow only safe characters for ALSA device names (alphanumeric, colon, comma, hyphen, dot)
@@ -155,6 +190,7 @@ log "Installing for user: $REAL_USER (home: $REAL_HOME)"
 log "Voice-assistant dir: $VOICE_DIR"
 log "LLM model          : $MODEL_NAME"
 log "Record seconds     : $RECORD_SECONDS"
+log "LLM timeout        : $LLM_TIMEOUT"
 log "ACPI event match   : $ACPI_EVENT_MATCH"
 
 # ─── 1. System dependencies ───────────────────────────────────────────────────
@@ -332,6 +368,7 @@ set -euo pipefail
 
 MODEL_NAME="${MODEL_NAME}"
 RECORD_SECONDS="${RECORD_SECONDS}"
+LLM_TIMEOUT="${LLM_TIMEOUT}"
 MIC_DEVICE="${MIC_DEVICE}"
 SPEAKER_DEVICE="${SPEAKER_DEVICE}"
 LOGFILE="${LOGFILE}"
@@ -397,9 +434,9 @@ if [[ -z "\$TRANSCRIPT" ]]; then
 fi
 logit "[voice] Transcript: \$TRANSCRIPT"
 
-# 3. Query Ollama
+# 3. Query Ollama (timeout prevents the pipeline hanging indefinitely)
 logit "[voice] Querying Ollama model: \$MODEL_NAME"
-RESPONSE="\$(ollama run "\$MODEL_NAME" "\$TRANSCRIPT" 2>>\$LOGFILE || echo "I'm sorry, I could not get a response.")"
+RESPONSE="\$(timeout "\$LLM_TIMEOUT" ollama run "\$MODEL_NAME" "\$TRANSCRIPT" 2>>\$LOGFILE || echo "I'm sorry, I could not get a response.")"
 logit "[voice] Response: \$RESPONSE"
 
 # 4. Speak response with Piper + aplay
@@ -533,6 +570,7 @@ set -euo pipefail
 
 HTPC_USER="${REAL_USER}"
 MODEL_NAME="${MODEL_NAME}"
+LLM_TIMEOUT="${LLM_TIMEOUT}"
 LOGFILE="${LOGFILE}"
 VOICE_DIR="${VOICE_DIR}"
 VENV_DIR="${VOICE_DIR}/venv"
@@ -595,7 +633,7 @@ echo -n "  voice model     ... "
 
 # 7. LLM prompt test
 echo "  LLM test prompt ..."
-if RESPONSE="\$(ollama run "\$MODEL_NAME" "Reply only: test OK" 2>/dev/null)" && [[ -n "\$RESPONSE" ]]; then
+if RESPONSE="\$(timeout "\$LLM_TIMEOUT" ollama run "\$MODEL_NAME" "Reply only: test OK" 2>/dev/null)" && [[ -n "\$RESPONSE" ]]; then
   echo "    LLM reply: \$(echo "\$RESPONSE" | head -1) ✓"
 else
   echo "  ✗ LLM test FAILED (empty or error response)"; exit 1
