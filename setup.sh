@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# setup.sh — Idempotent NUC voice-assistant installer for Nobara HTPC
+# setup.sh — Idempotent NUC HTPC installer for Nobara (voice assistant + Steam shell + Kodi)
 # Usage:  sudo ./setup.sh [--event 'button/power PBTN 00000080 00000000']
 #                         [--model mistral]  [--record-seconds 5]
 #                         [--mic-device hw:0,0] [--speaker-device hw:0,0]
+#                         [--tv-width 3840] [--tv-height 2160]
+#                         [--render-width 1920] [--render-height 1080]
+#                         [--framerate 60]
+#                         [--kodi-host localhost] [--kodi-port 8080]
+#                         [--kodi-user kodi] [--kodi-pass kodi]
 set -euo pipefail
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
@@ -16,15 +21,35 @@ LOGFILE="/var/log/nuc-voice-assistant.log"
 VOICE_DIR=""          # resolved after we know the real user
 PIPER_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
 PIPER_JSON_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+# HTPC / TV output defaults (Phase 1 + 4)
+TV_WIDTH="${TV_WIDTH:-3840}"
+TV_HEIGHT="${TV_HEIGHT:-2160}"
+RENDER_WIDTH="${RENDER_WIDTH:-1920}"
+RENDER_HEIGHT="${RENDER_HEIGHT:-1080}"
+FRAMERATE="${FRAMERATE:-60}"
+# Kodi JSON-RPC defaults (Phase 2 + 3)
+KODI_HOST="${KODI_HOST:-localhost}"
+KODI_PORT="${KODI_PORT:-8080}"
+KODI_USER="${KODI_USER:-kodi}"
+KODI_PASS="${KODI_PASS:-kodi}"
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --event)         ACPI_EVENT_MATCH="$2"; shift 2 ;;
-    --model)         MODEL_NAME="$2"; shift 2 ;;
+    --event)          ACPI_EVENT_MATCH="$2"; shift 2 ;;
+    --model)          MODEL_NAME="$2"; shift 2 ;;
     --record-seconds) RECORD_SECONDS="$2"; shift 2 ;;
-    --mic-device)    MIC_DEVICE="$2"; shift 2 ;;
+    --mic-device)     MIC_DEVICE="$2"; shift 2 ;;
     --speaker-device) SPEAKER_DEVICE="$2"; shift 2 ;;
+    --tv-width)       TV_WIDTH="$2"; shift 2 ;;
+    --tv-height)      TV_HEIGHT="$2"; shift 2 ;;
+    --render-width)   RENDER_WIDTH="$2"; shift 2 ;;
+    --render-height)  RENDER_HEIGHT="$2"; shift 2 ;;
+    --framerate)      FRAMERATE="$2"; shift 2 ;;
+    --kodi-host)      KODI_HOST="$2"; shift 2 ;;
+    --kodi-port)      KODI_PORT="$2"; shift 2 ;;
+    --kodi-user)      KODI_USER="$2"; shift 2 ;;
+    --kodi-pass)      KODI_PASS="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -41,6 +66,17 @@ if [[ "$MIC_DEVICE" != "default" ]] && ! [[ "$MIC_DEVICE" =~ ^[a-zA-Z0-9_:,.-]+$
 fi
 if [[ "$SPEAKER_DEVICE" != "default" ]] && ! [[ "$SPEAKER_DEVICE" =~ ^[a-zA-Z0-9_:,.-]+$ ]]; then
   echo "Error: --speaker-device contains invalid characters (allowed: a-z A-Z 0-9 _ : , . -)." >&2
+  exit 1
+fi
+for _dimvar in TV_WIDTH TV_HEIGHT RENDER_WIDTH RENDER_HEIGHT FRAMERATE; do
+  _dimval="${!_dimvar}"
+  if ! [[ "$_dimval" =~ ^[0-9]+$ ]] || [[ "$_dimval" -lt 1 ]]; then
+    echo "Error: --${_dimvar//_/-} must be a positive integer." >&2
+    exit 1
+  fi
+done
+if ! [[ "$KODI_PORT" =~ ^[0-9]+$ ]] || [[ "$KODI_PORT" -lt 1 ]] || [[ "$KODI_PORT" -gt 65535 ]]; then
+  echo "Error: --kodi-port must be an integer between 1 and 65535." >&2
   exit 1
 fi
 
@@ -156,6 +192,8 @@ log "Voice-assistant dir: $VOICE_DIR"
 log "LLM model          : $MODEL_NAME"
 log "Record seconds     : $RECORD_SECONDS"
 log "ACPI event match   : $ACPI_EVENT_MATCH"
+log "TV resolution      : ${TV_WIDTH}x${TV_HEIGHT} (render ${RENDER_WIDTH}x${RENDER_HEIGHT} @ ${FRAMERATE}fps)"
+log "Kodi JSON-RPC      : http://${KODI_HOST}:${KODI_PORT}"
 
 # ─── 1. System dependencies ───────────────────────────────────────────────────
 log "=== Step 1: System dependencies ==="
@@ -192,6 +230,28 @@ if [[ ${#TO_INSTALL[@]} -gt 0 ]]; then
   dnf -y install "${TO_INSTALL[@]}"
 else
   ok "All system packages already installed"
+fi
+
+# ─── 1b. Optional HTPC packages (Steam, Kodi, emulators) ─────────────────────
+log "=== Step 1b: Optional HTPC packages ==="
+
+HTPC_PKGS=(steam gamescope kodi dolphin-emu retroarch moonlight-qt)
+HTPC_TO_INSTALL=()
+for pkg in "${HTPC_PKGS[@]}"; do
+  if rpm -q "$pkg" &>/dev/null; then
+    ok "$pkg already installed"
+  elif dnf info "$pkg" &>/dev/null 2>&1; then
+    HTPC_TO_INSTALL+=("$pkg")
+  else
+    warn "Optional package '$pkg' not found in enabled repos; skipping. Enable RPMFusion or use Flatpak to install it manually."
+  fi
+done
+
+if [[ ${#HTPC_TO_INSTALL[@]} -gt 0 ]]; then
+  log "Installing optional HTPC packages: ${HTPC_TO_INSTALL[*]}"
+  dnf -y install "${HTPC_TO_INSTALL[@]}" || warn "Some optional HTPC packages failed to install; continuing."
+else
+  ok "All optional HTPC packages handled"
 fi
 
 # ─── 2. Install & enable Ollama ───────────────────────────────────────────────
@@ -319,14 +379,161 @@ if [[ ! -f "$VOICE_JSON" ]]; then
   ok "Downloaded $VOICE_JSON"
 fi
 
-# ─── 5. Create voice_trigger.sh ───────────────────────────────────────────────
+# ─── 5. Create voice_trigger.sh + Python helpers ─────────────────────────────
 log "=== Step 5: voice_trigger.sh ==="
 
+# ── 5a. intent_detect.py ─────────────────────────────────────────────────────
+INTENT_SCRIPT="$VOICE_DIR/intent_detect.py"
+cat > "$INTENT_SCRIPT" << 'INTENT_PY_EOF'
+#!/usr/bin/env python3
+"""intent_detect.py — Classify a voice transcript into a structured JSON intent
+using an Ollama LLM.  Called from voice_trigger.sh.
+
+Usage: python3 intent_detect.py <transcript> <model_name> <out_json_path>
+"""
+import json
+import re
+import subprocess
+import sys
+
+
+def main() -> None:
+    transcript = sys.argv[1]
+    model      = sys.argv[2]
+    out_path   = sys.argv[3]
+
+    prompt = (
+        "You are a smart-home media controller. Parse the voice command below "
+        "and respond ONLY with a single valid JSON object — no markdown, no "
+        "explanation.\n\n"
+        "Voice command: " + json.dumps(transcript) + "\n\n"
+        "Choose exactly ONE of these JSON responses:\n"
+        '{"action":"play","query":"<title or show name>"}\n'
+        '{"action":"pause"}\n'
+        '{"action":"stop"}\n'
+        '{"action":"resume"}\n'
+        '{"action":"next"}\n'
+        '{"action":"previous"}\n'
+        '{"action":"volume","level":<integer 0-100>}\n'
+        '{"action":"answer","response":"<concise answer in 1-2 sentences>"}\n\n'
+        "JSON only:"
+    )
+
+    result = subprocess.run(
+        ["ollama", "run", model, prompt],
+        capture_output=True, text=True, timeout=30
+    )
+    text = result.stdout.strip()
+
+    # Extract the first JSON object from the model response
+    m = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            intent = json.dumps(obj)
+        except json.JSONDecodeError:
+            intent = json.dumps({"action": "answer",
+                                 "response": text[:300] or "I could not understand that."})
+    else:
+        intent = json.dumps({"action": "answer",
+                             "response": text[:300] if text else "I could not understand that."})
+
+    with open(out_path, "w") as f:
+        f.write(intent)
+
+
+if __name__ == "__main__":
+    main()
+INTENT_PY_EOF
+
+chown "$REAL_USER:$(id -gn "$REAL_USER")" "$INTENT_SCRIPT"
+chmod 644 "$INTENT_SCRIPT"
+ok "Created $INTENT_SCRIPT"
+
+# ── 5b. kodi_search.py ───────────────────────────────────────────────────────
+KODI_SEARCH_SCRIPT="$VOICE_DIR/kodi_search.py"
+cat > "$KODI_SEARCH_SCRIPT" << 'KODI_SEARCH_PY_EOF'
+#!/usr/bin/env python3
+"""kodi_search.py — Search the Kodi library for a title and print a
+Player.Open item parameter (JSON) if found, or an empty string if not.
+
+Usage: python3 kodi_search.py <query> <kodi_jsonrpc_url> <user:pass>
+  e.g. python3 kodi_search.py "Stargate Universe" \
+           http://localhost:8080/jsonrpc kodi:kodi
+"""
+import base64
+import json
+import sys
+import urllib.request
+
+
+def kodi_call(url: str, auth: str, method: str, params: dict | None = None) -> dict:
+    body = json.dumps({
+        "jsonrpc": "2.0", "method": method,
+        "params": params or {}, "id": 1,
+    }).encode()
+    token = base64.b64encode(auth.encode()).decode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Basic {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return {}
+
+
+def main() -> None:
+    query = sys.argv[1]
+    url   = sys.argv[2]
+    auth  = sys.argv[3]
+
+    filt = {"filter": {"field": "title", "operator": "contains", "value": query},
+            "limits": {"end": 5}}
+
+    # 1. TV shows → episodes
+    shows = (kodi_call(url, auth, "VideoLibrary.GetTVShows",
+                       {**filt, "properties": ["title"]})
+             .get("result", {}).get("tvshows", []))
+    if shows:
+        eps = (kodi_call(url, auth, "VideoLibrary.GetEpisodes", {
+                   "tvshowid": shows[0]["tvshowid"],
+                   "sort": {"order": "ascending", "method": "episode"},
+                   "limits": {"end": 1},
+                   "properties": ["title"],
+               }).get("result", {}).get("episodes", []))
+        if eps:
+            print(json.dumps({"episodeid": eps[0]["episodeid"]}))
+            return
+
+    # 2. Movies
+    movies = (kodi_call(url, auth, "VideoLibrary.GetMovies",
+                        {**filt, "properties": ["title"]})
+              .get("result", {}).get("movies", []))
+    if movies:
+        print(json.dumps({"movieid": movies[0]["movieid"]}))
+        return
+
+    # Nothing found
+    print("")
+
+
+if __name__ == "__main__":
+    main()
+KODI_SEARCH_PY_EOF
+
+chown "$REAL_USER:$(id -gn "$REAL_USER")" "$KODI_SEARCH_SCRIPT"
+chmod 644 "$KODI_SEARCH_SCRIPT"
+ok "Created $KODI_SEARCH_SCRIPT"
+
+# ── 5c. voice_trigger.sh ─────────────────────────────────────────────────────
 TRIGGER_SCRIPT="$VOICE_DIR/voice_trigger.sh"
 
 cat > "$TRIGGER_SCRIPT" << TRIGGER_EOF
 #!/usr/bin/env bash
-# voice_trigger.sh — STT → LLM → TTS pipeline
+# voice_trigger.sh — STT → Intent → Kodi/TTS pipeline
 # Invoked by ACPI event; runs as the real user via sudo -u in the ACPI action.
 set -euo pipefail
 
@@ -339,6 +546,10 @@ VOICE_DIR="${VOICE_DIR}"
 VENV_DIR="${VOICE_DIR}/venv"
 PIPER_BIN="${PIPER_BIN}"
 VOICE_MODEL="${VOICES_DIR}/en_US-lessac-medium.onnx"
+KODI_HOST="${KODI_HOST}"
+KODI_PORT="${KODI_PORT}"
+KODI_USER="${KODI_USER}"
+KODI_PASS="${KODI_PASS}"
 
 # Private temp directory — 700 so other users cannot read recorded audio/transcripts
 TMP_DIR="\${VOICE_DIR}/tmp"
@@ -347,15 +558,34 @@ chmod 700 "\$TMP_DIR"
 IN_WAV="\${TMP_DIR}/nuc_assistant_in.wav"
 OUT_WAV="\${TMP_DIR}/nuc_assistant_out.wav"
 TRANSCRIPT_FILE="\${TMP_DIR}/nuc_assistant_transcript.txt"
+INTENT_FILE="\${TMP_DIR}/nuc_assistant_intent.json"
 
 ts() { date '+%Y-%m-%dT%H:%M:%S'; }
 logit() { echo "\$(ts) \$*" | tee -a "\$LOGFILE"; }
 
 # Clean up temp files on exit (success or error)
-cleanup() { rm -f "\$IN_WAV" "\$OUT_WAV" "\$TRANSCRIPT_FILE"; }
+cleanup() { rm -f "\$IN_WAV" "\$OUT_WAV" "\$TRANSCRIPT_FILE" "\$INTENT_FILE"; }
 trap cleanup EXIT
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\${VENV_DIR}/bin"
+
+# Send a Kodi JSON-RPC request; prints response JSON (or {} on error)
+kodi_rpc() {
+  local method="\$1" params="\${2:-{}}"
+  curl -sf --max-time 10 \
+    -u "\${KODI_USER}:\${KODI_PASS}" \
+    -H "Content-Type: application/json" \
+    -d "{\"jsonrpc\":\"2.0\",\"method\":\"\${method}\",\"params\":\${params},\"id\":1}" \
+    "http://\${KODI_HOST}:\${KODI_PORT}/jsonrpc" 2>>\$LOGFILE || echo "{}"
+}
+
+# Return active player ID, or empty string if nothing is playing
+get_player_id() {
+  kodi_rpc "Player.GetActivePlayers" "{}" | \
+    "\${VENV_DIR}/bin/python3" -c \
+    "import sys,json; pl=json.load(sys.stdin).get('result',[]); print(pl[0]['playerid'] if pl else '')" \
+    2>/dev/null || echo ""
+}
 
 logit "[voice] Starting voice assistant pipeline"
 
@@ -397,12 +627,79 @@ if [[ -z "\$TRANSCRIPT" ]]; then
 fi
 logit "[voice] Transcript: \$TRANSCRIPT"
 
-# 3. Query Ollama
-logit "[voice] Querying Ollama model: \$MODEL_NAME"
-RESPONSE="\$(ollama run "\$MODEL_NAME" "\$TRANSCRIPT" 2>>\$LOGFILE || echo "I'm sorry, I could not get a response.")"
+# 3. Intent detection via Ollama
+logit "[voice] Detecting intent (model: \$MODEL_NAME)..."
+"\${VENV_DIR}/bin/python3" "\${VOICE_DIR}/intent_detect.py" \
+  "\$TRANSCRIPT" "\$MODEL_NAME" "\$INTENT_FILE" 2>>\$LOGFILE || \
+  echo '{"action":"answer","response":"I could not process that request."}' > "\$INTENT_FILE"
+
+INTENT_JSON="\$(cat "\$INTENT_FILE" 2>/dev/null || echo '{"action":"answer","response":"I could not process that request."}')"
+ACTION="\$("\${VENV_DIR}/bin/python3" -c \
+  "import sys,json; print(json.loads(sys.argv[1]).get('action','answer'))" \
+  "\$INTENT_JSON" 2>/dev/null || echo "answer")"
+logit "[voice] Intent: \$ACTION"
+
+# 4. Dispatch on intent
+RESPONSE=""
+case "\$ACTION" in
+  play)
+    QUERY="\$("\${VENV_DIR}/bin/python3" -c \
+      "import sys,json; print(json.loads(sys.argv[1]).get('query',''))" \
+      "\$INTENT_JSON" 2>/dev/null || echo "")"
+    logit "[voice] Searching Kodi library for: \$QUERY"
+    PLAY_ITEM="\$("\${VENV_DIR}/bin/python3" "\${VOICE_DIR}/kodi_search.py" \
+      "\$QUERY" \
+      "http://\${KODI_HOST}:\${KODI_PORT}/jsonrpc" \
+      "\${KODI_USER}:\${KODI_PASS}" 2>>\$LOGFILE || echo "")"
+    if [[ -n "\$PLAY_ITEM" ]]; then
+      kodi_rpc "Player.Open" "{\"item\":\${PLAY_ITEM}}" >/dev/null
+      RESPONSE="Playing \${QUERY}"
+    else
+      RESPONSE="I could not find \${QUERY} in your Kodi library."
+    fi
+    ;;
+  pause)
+    PID="\$(get_player_id)"
+    [[ -n "\$PID" ]] && kodi_rpc "Player.PlayPause" "{\"playerid\":\${PID}}" >/dev/null
+    RESPONSE="\${PID:+Paused}\${PID:-Nothing is playing}"
+    ;;
+  stop)
+    PID="\$(get_player_id)"
+    [[ -n "\$PID" ]] && kodi_rpc "Player.Stop" "{\"playerid\":\${PID}}" >/dev/null
+    RESPONSE="\${PID:+Stopped}\${PID:-Nothing is playing}"
+    ;;
+  resume)
+    PID="\$(get_player_id)"
+    [[ -n "\$PID" ]] && kodi_rpc "Player.PlayPause" "{\"playerid\":\${PID}}" >/dev/null
+    RESPONSE="\${PID:+Resumed}\${PID:-Nothing is playing}"
+    ;;
+  next)
+    PID="\$(get_player_id)"
+    [[ -n "\$PID" ]] && kodi_rpc "Player.GoTo" "{\"playerid\":\${PID},\"to\":\"next\"}" >/dev/null
+    RESPONSE="\${PID:+Next}\${PID:-Nothing is playing}"
+    ;;
+  previous)
+    PID="\$(get_player_id)"
+    [[ -n "\$PID" ]] && kodi_rpc "Player.GoTo" "{\"playerid\":\${PID},\"to\":\"previous\"}" >/dev/null
+    RESPONSE="\${PID:+Previous}\${PID:-Nothing is playing}"
+    ;;
+  volume)
+    LEVEL="\$("\${VENV_DIR}/bin/python3" -c \
+      "import sys,json; print(int(json.loads(sys.argv[1]).get('level',50)))" \
+      "\$INTENT_JSON" 2>/dev/null || echo "50")"
+    kodi_rpc "Application.SetVolume" "{\"volume\":\${LEVEL}}" >/dev/null
+    RESPONSE="Volume set to \${LEVEL} percent"
+    ;;
+  answer|*)
+    RESPONSE="\$("\${VENV_DIR}/bin/python3" -c \
+      "import sys,json; print(json.loads(sys.argv[1]).get('response','I am not sure about that.'))" \
+      "\$INTENT_JSON" 2>/dev/null || echo "I am not sure about that.")"
+    ;;
+esac
+
 logit "[voice] Response: \$RESPONSE"
 
-# 4. Speak response with Piper + aplay
+# 5. Speak response with Piper + aplay
 logit "[voice] Synthesizing speech..."
 echo "\$RESPONSE" | "\$PIPER_BIN" --model "\$VOICE_MODEL" --output_file "\$OUT_WAV" 2>>\$LOGFILE
 
@@ -525,7 +822,7 @@ log "=== Step 8: nuc-voice-test command ==="
 TEST_CMD="/usr/local/bin/nuc-voice-test"
 cat > "$TEST_CMD" << TESTEOF
 #!/usr/bin/env bash
-# nuc-voice-test — verify voice assistant components
+# nuc-voice-test — verify voice assistant + HTPC components
 # Service checks (ollama, acpid) are done as-is; pipeline checks are always
 # run as the real HTPC user (${REAL_USER}) to match the voice assistant's
 # actual runtime environment.
@@ -539,6 +836,10 @@ VENV_DIR="${VOICE_DIR}/venv"
 PIPER_BIN="${PIPER_BIN}"
 VOICE_MODEL="${VOICES_DIR}/en_US-lessac-medium.onnx"
 SPEAKER_DEVICE="${SPEAKER_DEVICE}"
+KODI_HOST="${KODI_HOST}"
+KODI_PORT="${KODI_PORT}"
+KODI_USER="${KODI_USER}"
+KODI_PASS="${KODI_PASS}"
 
 OUT_WAV="\${VOICE_DIR}/tmp/nuc_voice_test.wav"
 TEST_PHRASE="Voice assistant test successful."
@@ -546,7 +847,7 @@ TEST_PHRASE="Voice assistant test successful."
 ts() { date '+%Y-%m-%dT%H:%M:%S'; }
 logit() { echo "\$(ts) \$*" | tee -a "\$LOGFILE"; }
 
-echo "=== NUC Voice Assistant — Self Test ==="
+echo "=== NUC HTPC — Self Test ==="
 
 # ── Service checks (safe to run as root or user) ────────────────────────────
 
@@ -570,6 +871,18 @@ else
   echo "NOT running ✗"; exit 1
 fi
 
+# 4. Kodi JSON-RPC reachability (non-fatal — Kodi may not be running yet)
+echo -n "  Kodi JSON-RPC   ... "
+if curl -sf --max-time 5 \
+    -u "\${KODI_USER}:\${KODI_PASS}" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","method":"JSONRPC.Ping","id":1}' \
+    "http://\${KODI_HOST}:\${KODI_PORT}/jsonrpc" 2>/dev/null | grep -q '"pong"'; then
+  echo "reachable ✓"
+else
+  echo "not reachable (start Kodi and enable HTTP remote control to use voice commands) ⚠"
+fi
+
 # ── Pipeline checks — re-exec as HTPC_USER if currently root ───────────────
 # This ensures we test the exact environment the voice assistant uses.
 if [[ \$EUID -eq 0 ]] && [[ "\$(whoami)" != "\$HTPC_USER" ]]; then
@@ -577,11 +890,19 @@ if [[ \$EUID -eq 0 ]] && [[ "\$(whoami)" != "\$HTPC_USER" ]]; then
   exec sudo -u "\$HTPC_USER" "\$0" --pipeline-only
 fi
 
-# 4. faster-whisper importable
+# 5. faster-whisper importable
 echo -n "  faster-whisper  ... "
 "\$VENV_DIR/bin/python3" -c "import faster_whisper; print('importable ✓')" || { echo "FAILED ✗"; exit 1; }
 
-# 5. piper binary
+# 6. intent_detect.py present
+echo -n "  intent_detect   ... "
+[[ -f "\${VOICE_DIR}/intent_detect.py" ]] && echo "present ✓" || { echo "MISSING ✗"; exit 1; }
+
+# 7. kodi_search.py present
+echo -n "  kodi_search     ... "
+[[ -f "\${VOICE_DIR}/kodi_search.py" ]] && echo "present ✓" || { echo "MISSING ✗"; exit 1; }
+
+# 8. piper binary
 echo -n "  piper binary    ... "
 if [[ -x "\$PIPER_BIN" ]] || command -v piper &>/dev/null; then
   echo "found ✓"
@@ -589,11 +910,11 @@ else
   echo "NOT found ✗"; exit 1
 fi
 
-# 6. voice model
+# 9. voice model
 echo -n "  voice model     ... "
 [[ -f "\$VOICE_MODEL" ]] && echo "present ✓" || { echo "MISSING ✗"; exit 1; }
 
-# 7. LLM prompt test
+# 10. LLM prompt test
 echo "  LLM test prompt ..."
 if RESPONSE="\$(ollama run "\$MODEL_NAME" "Reply only: test OK" 2>/dev/null)" && [[ -n "\$RESPONSE" ]]; then
   echo "    LLM reply: \$(echo "\$RESPONSE" | head -1) ✓"
@@ -601,7 +922,7 @@ else
   echo "  ✗ LLM test FAILED (empty or error response)"; exit 1
 fi
 
-# 8. TTS + playback test
+# 11. TTS + playback test
 echo "  TTS test ..."
 mkdir -p "\$(dirname "\$OUT_WAV")" && chmod 700 "\$(dirname "\$OUT_WAV")"
 echo "\$TEST_PHRASE" | "\$PIPER_BIN" --model "\$VOICE_MODEL" --output_file "\$OUT_WAV" 2>/dev/null
@@ -635,13 +956,296 @@ chown "$REAL_USER:$(id -gn "$REAL_USER")" "$LOGFILE"
 echo "$(date '+%Y-%m-%dT%H:%M:%S') [setup] Installation complete." >> "$LOGFILE"
 ok "Log file ready: $LOGFILE"
 
-# ─── 10. Verification summary ─────────────────────────────────────────────────
-cat << 'SUMMARY'
+# ─── 10. Steam + Gamescope autostart (Phase 1 + 4) ───────────────────────────
+log "=== Step 10: Steam + Gamescope autostart ==="
+
+AUTOSTART_DIR="$REAL_HOME/.config/autostart"
+install -d -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$AUTOSTART_DIR"
+
+STEAM_DESKTOP="$AUTOSTART_DIR/steam-gaming.desktop"
+cat > "$STEAM_DESKTOP" << DESKTOPEOF
+[Desktop Entry]
+Type=Application
+Name=Steam Gaming Mode
+Comment=Launch Steam Gamepad UI via gamescope (managed by setup.sh)
+Exec=gamescope -f -r ${FRAMERATE} -w ${RENDER_WIDTH} -h ${RENDER_HEIGHT} -W ${TV_WIDTH} -H ${TV_HEIGHT} -- steam -gamepadui
+X-GNOME-Autostart-enabled=true
+DESKTOPEOF
+
+chown "$REAL_USER:$(id -gn "$REAL_USER")" "$STEAM_DESKTOP"
+chmod 644 "$STEAM_DESKTOP"
+ok "Created $STEAM_DESKTOP"
+ok "gamescope args: -f -r ${FRAMERATE} -w ${RENDER_WIDTH} -h ${RENDER_HEIGHT} -W ${TV_WIDTH} -H ${TV_HEIGHT}"
+
+if ! command -v gamescope &>/dev/null; then
+  warn "gamescope not found in PATH; install it (dnf install gamescope) for the autostart to work."
+fi
+if ! command -v steam &>/dev/null; then
+  warn "steam not found in PATH; install it (dnf install steam) for the autostart to work."
+fi
+
+# ─── 11. Kodi HTTP API configuration (Phase 2 + 3) ────────────────────────────
+log "=== Step 11: Kodi HTTP API configuration ==="
+
+KODI_USERDATA="$REAL_HOME/.kodi/userdata"
+install -d -o "$REAL_USER" -g "$(id -gn "$REAL_USER")" "$KODI_USERDATA"
+
+KODI_ADVSETTINGS="$KODI_USERDATA/advancedsettings.xml"
+if [[ ! -f "$KODI_ADVSETTINGS" ]]; then
+  cat > "$KODI_ADVSETTINGS" << KODIXML
+<advancedsettings>
+  <services>
+    <webserver>true</webserver>
+    <webserverport>${KODI_PORT}</webserverport>
+    <webserverusername>${KODI_USER}</webserverusername>
+    <webserverpassword>${KODI_PASS}</webserverpassword>
+    <zeroconf>true</zeroconf>
+  </services>
+</advancedsettings>
+KODIXML
+  chown "$REAL_USER:$(id -gn "$REAL_USER")" "$KODI_ADVSETTINGS"
+  chmod 644 "$KODI_ADVSETTINGS"
+  ok "Created Kodi advancedsettings.xml (HTTP JSON-RPC on port ${KODI_PORT})"
+else
+  ok "Kodi advancedsettings.xml already exists; skipping (edit $KODI_ADVSETTINGS manually if needed)"
+fi
+
+warn "In Kodi: Settings → Services → Control → enable 'Allow remote control via HTTP' and set the same port/credentials."
+warn "Add Kodi to Steam: Steam → Add Non-Steam Game → Kodi."
+
+# ─── 12. Appliance mode (Phase 5) ─────────────────────────────────────────────
+log "=== Step 12: Appliance mode ==="
+
+# Disable DPMS / screen blanking via an autostart script that runs xset
+XSET_DESKTOP="$AUTOSTART_DIR/disable-screen-blanking.desktop"
+cat > "$XSET_DESKTOP" << XSETEOF
+[Desktop Entry]
+Type=Application
+Name=Disable Screen Blanking
+Comment=Keep the TV on (HTPC appliance mode — managed by setup.sh)
+Exec=bash -c "xset dpms 0 0 0 && xset s off && xset s noblank"
+X-GNOME-Autostart-enabled=true
+XSETEOF
+chown "$REAL_USER:$(id -gn "$REAL_USER")" "$XSET_DESKTOP"
+chmod 644 "$XSET_DESKTOP"
+ok "Created $XSET_DESKTOP (disables DPMS/screen blanking on login)"
+
+# KDE Power Management — disable all sleep/hibernate actions
+KDE_POWER_CFG="$REAL_HOME/.config/powermanagementprofilesrc"
+if [[ ! -f "$KDE_POWER_CFG" ]]; then
+  cat > "$KDE_POWER_CFG" << KDEPOWER
+[AC][DPMSControl]
+idleTime=0
+lockBeforeTurnOff=0
+turnOffDisplayWhenIdle=false
+
+[AC][DimDisplay]
+idleTime=0
+whenIdle=false
+
+[AC][HandleButtonEvents]
+lidAction=0
+powerButtonAction=0
+powerDownAction=0
+
+[AC][SuspendSession]
+idleTime=0
+suspendThenHibernate=false
+suspendType=0
+whenIdle=false
+KDEPOWER
+  chown "$REAL_USER:$(id -gn "$REAL_USER")" "$KDE_POWER_CFG"
+  chmod 644 "$KDE_POWER_CFG"
+  ok "Created KDE power management profile (appliance mode — no sleep/suspend)"
+else
+  ok "KDE power management config already exists; skipping (edit $KDE_POWER_CFG manually if needed)"
+fi
+
+# Suppress KDE desktop notifications for a clean TV-facing experience
+KDE_NOTIFY_CFG="$REAL_HOME/.config/plasmanotifyrc"
+if [[ ! -f "$KDE_NOTIFY_CFG" ]]; then
+  cat > "$KDE_NOTIFY_CFG" << KDNOTIFY
+[DoNotDisturb]
+Until=0000-00-00T00:00:00
+WhenRunningFullscreen=true
+KDNOTIFY
+  chown "$REAL_USER:$(id -gn "$REAL_USER")" "$KDE_NOTIFY_CFG"
+  chmod 644 "$KDE_NOTIFY_CFG"
+  ok "Created KDE notification config (suppressed during fullscreen)"
+else
+  ok "KDE notification config already exists; skipping"
+fi
+
+# ─── 13. Non-Steam shortcuts helper (Phase 6) ─────────────────────────────────
+log "=== Step 13: Non-Steam shortcuts helper ==="
+
+ADD_SHORTCUTS_CMD="/usr/local/bin/htpc-add-steam-shortcuts"
+cat > "$ADD_SHORTCUTS_CMD" << 'SHORTCUTS_EOF'
+#!/usr/bin/env bash
+# htpc-add-steam-shortcuts — add HTPC apps (Kodi, Firefox, Dolphin, RetroArch,
+# Moonlight) as non-Steam games so they appear in the Steam Gamepad UI.
+#
+# Run this script AFTER Steam has been launched at least once (so that the
+# Steam userdata directory and shortcuts.vdf file exist).
+#
+# Usage: htpc-add-steam-shortcuts [--dry-run]
+set -euo pipefail
+
+DRY_RUN=false
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+
+STEAM_ROOT="${HOME}/.local/share/Steam"
+if [[ ! -d "$STEAM_ROOT" ]]; then
+  echo "Error: Steam root not found at $STEAM_ROOT." >&2
+  echo "       Launch Steam at least once before running this script." >&2
+  exit 1
+fi
+
+# Locate the first Steam user's shortcuts.vdf
+USERDATA_DIR="$STEAM_ROOT/userdata"
+SHORTCUTS_VDF=""
+for uid_dir in "$USERDATA_DIR"/*/; do
+  candidate="$uid_dir/config/shortcuts.vdf"
+  if [[ -d "$uid_dir" ]] && [[ "${uid_dir##*/}" =~ ^[0-9]+$ ]]; then
+    SHORTCUTS_VDF="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$SHORTCUTS_VDF" ]]; then
+  echo "Error: no Steam user account found in $USERDATA_DIR." >&2
+  echo "       Log in to Steam at least once before running this script." >&2
+  exit 1
+fi
+
+echo "Target shortcuts.vdf: $SHORTCUTS_VDF"
+install -d "$(dirname "$SHORTCUTS_VDF")"
+
+# Build shortcuts using Python (standard library only — no pip packages needed)
+PYTHON_CMD="$(command -v python3 2>/dev/null || command -v python 2>/dev/null)"
+if [[ -z "$PYTHON_CMD" ]]; then
+  echo "Error: python3 not found." >&2; exit 1
+fi
+
+# Declare apps to add: "AppName|Exe|Icon"
+declare -a HTPC_APPS=(
+  "Kodi|/usr/bin/kodi|/usr/share/pixmaps/kodi.png"
+  "Firefox|/usr/bin/firefox|/usr/lib64/firefox/browser/chrome/icons/default/default128.png"
+  "Dolphin Emulator|/usr/bin/dolphin-emu|/usr/share/pixmaps/dolphin-emu.png"
+  "RetroArch|/usr/bin/retroarch|/usr/share/pixmaps/retroarch.png"
+  "Moonlight|/usr/bin/moonlight-qt|"
+)
+
+$DRY_RUN && echo "[dry-run] Would write to: $SHORTCUTS_VDF" && exit 0
+
+"$PYTHON_CMD" - "$SHORTCUTS_VDF" "${HTPC_APPS[@]}" << 'PYEOF'
+"""Append non-Steam shortcuts to Steam's binary shortcuts.vdf.
+
+The shortcuts.vdf format is a simple binary Key/Value store:
+  \x00shortcuts\x00
+    \x00<index>\x00
+      \x01appname\x00<name>\x00
+      \x01exe\x00<path>\x00
+      \x01StartDir\x00<dir>\x00
+      \x01icon\x00<path>\x00
+      \x01tags\x00\x08\x08
+    \x08\x08
+  \x08\x08
+"""
+import os, struct, sys
+
+vdf_path = sys.argv[1]
+app_specs = sys.argv[2:]
+
+def read_vdf(path):
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read()
+    return b""
+
+def parse_entries(data):
+    """Return list of raw entry byte-strings from an existing shortcuts.vdf."""
+    entries = []
+    # Skip header: \x00shortcuts\x00
+    hdr = b"\x00shortcuts\x00"
+    if not data.startswith(hdr):
+        return entries
+    pos = len(hdr)
+    # Each entry starts with \x00<idx>\x00 and ends with \x08\x08
+    while pos < len(data) - 1:
+        if data[pos] == 0x08:  # outer terminator
+            break
+        end = data.find(b"\x08\x08", pos)
+        if end == -1:
+            break
+        entries.append(data[pos:end + 2])
+        pos = end + 2
+    return entries
+
+def make_entry(idx, name, exe, icon=""):
+    start_dir = os.path.dirname(exe) if exe else ""
+    entry  = b"\x00" + str(idx).encode() + b"\x00"
+    entry += b"\x01appname\x00"   + name.encode()       + b"\x00"
+    entry += b"\x01exe\x00"       + exe.encode()         + b"\x00"
+    entry += b"\x01StartDir\x00"  + start_dir.encode()   + b"\x00"
+    entry += b"\x01icon\x00"      + icon.encode()         + b"\x00"
+    entry += b"\x01tags\x00\x08\x08"
+    return entry
+
+def write_vdf(path, entries):
+    data = b"\x00shortcuts\x00"
+    for entry in entries:
+        data += entry
+    data += b"\x08\x08"
+    with open(path, "wb") as f:
+        f.write(data)
+
+raw = read_vdf(vdf_path)
+existing = parse_entries(raw)
+existing_names = set()
+for e in existing:
+    idx = e.find(b"\x01appname\x00")
+    if idx != -1:
+        start = idx + len(b"\x01appname\x00")
+        end = e.find(b"\x00", start)
+        existing_names.add(e[start:end].decode(errors="replace"))
+
+next_idx = len(existing)
+added = 0
+for spec in app_specs:
+    parts = spec.split("|")
+    name = parts[0] if len(parts) > 0 else ""
+    exe  = parts[1] if len(parts) > 1 else ""
+    icon = parts[2] if len(parts) > 2 else ""
+    if name in existing_names:
+        print(f"  skip (already present): {name}")
+        continue
+    existing.append(make_entry(next_idx, name, exe, icon))
+    next_idx += 1
+    added += 1
+    print(f"  added: {name} ({exe})")
+
+if added > 0:
+    write_vdf(vdf_path, existing)
+    print(f"\nAdded {added} shortcut(s) to {vdf_path}")
+    print("Restart Steam for changes to take effect.")
+else:
+    print("No new shortcuts to add.")
+PYEOF
+SHORTCUTS_EOF
+
+chmod 755 "$ADD_SHORTCUTS_CMD"
+ok "Created $ADD_SHORTCUTS_CMD"
+ok "Run 'htpc-add-steam-shortcuts' after launching Steam once to add HTPC apps to the Game Pad UI"
+
+# ─── 14. Verification summary ─────────────────────────────────────────────────
+cat << SUMMARY
 
 ╔══════════════════════════════════════════════════════════════════╗
-║            NUC Voice Assistant — Setup Complete                  ║
+║        NUC HTPC (Fire TV Cube Replacement) — Setup Complete       ║
 ╚══════════════════════════════════════════════════════════════════╝
 
+ ── Voice assistant ──────────────────────────────────────────────
  Check services:
    systemctl status ollama
    systemctl status acpid
@@ -655,7 +1259,34 @@ cat << 'SUMMARY'
  Tail the assistant log:
    sudo tail -f /var/log/nuc-voice-assistant.log
 
- Run the self-test:
+ Run the full self-test:
    nuc-voice-test
+
+ ── Steam Gamepad UI (Phase 1 + 4) ───────────────────────────────
+ Autostart entry: ${REAL_HOME}/.config/autostart/steam-gaming.desktop
+ Gamescope: render ${RENDER_WIDTH}x${RENDER_HEIGHT} → TV ${TV_WIDTH}x${TV_HEIGHT} @ ${FRAMERATE}fps
+ To change resolution, re-run:
+   sudo ./setup.sh --render-width 1920 --render-height 1080 --tv-width 3840 --tv-height 2160
+
+ ── Kodi (Phase 2 + 3) ───────────────────────────────────────────
+ HTTP JSON-RPC configured on http://${KODI_HOST}:${KODI_PORT}
+ In Kodi: Settings → Services → Control → enable "Allow remote control via HTTP"
+ Add Kodi to Steam Gamepad UI: Steam → Add Non-Steam Game → Kodi
+
+ Voice commands (press the front button, then speak):
+   "Play Stargate Universe"  →  Kodi searches library and plays
+   "Pause"                   →  Pauses current playback
+   "Stop"                    →  Stops playback
+   "Volume 50"               →  Sets Kodi volume to 50%
+
+ ── Add more apps to Steam Gamepad UI (Phase 6) ──────────────────
+ After launching Steam once, run:
+   htpc-add-steam-shortcuts
+ This adds Kodi, Firefox, Dolphin, RetroArch, and Moonlight.
+
+ ── Appliance mode (Phase 5) ─────────────────────────────────────
+ Screen blanking disabled via autostart xset script
+ KDE power management set to never sleep/suspend
+ KDE notifications suppressed in fullscreen
 
 SUMMARY
