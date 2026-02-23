@@ -68,10 +68,10 @@ if [[ "$SPEAKER_DEVICE" != "default" ]] && ! [[ "$SPEAKER_DEVICE" =~ ^[a-zA-Z0-9
   echo "Error: --speaker-device contains invalid characters (allowed: a-z A-Z 0-9 _ : , . -)." >&2
   exit 1
 fi
-for _dimvar in TV_WIDTH TV_HEIGHT RENDER_WIDTH RENDER_HEIGHT FRAMERATE; do
-  _dimval="${!_dimvar}"
-  if ! [[ "$_dimval" =~ ^[0-9]+$ ]] || [[ "$_dimval" -lt 1 ]]; then
-    echo "Error: --${_dimvar//_/-} must be a positive integer." >&2
+for _param_name in TV_WIDTH TV_HEIGHT RENDER_WIDTH RENDER_HEIGHT FRAMERATE; do
+  _param_val="${!_param_name}"
+  if ! [[ "$_param_val" =~ ^[0-9]+$ ]] || [[ "$_param_val" -lt 1 ]]; then
+    echo "Error: --${_param_name//_/-} must be a positive integer." >&2
     exit 1
   fi
 done
@@ -447,7 +447,7 @@ if __name__ == "__main__":
 INTENT_PY_EOF
 
 chown "$REAL_USER:$(id -gn "$REAL_USER")" "$INTENT_SCRIPT"
-chmod 644 "$INTENT_SCRIPT"
+chmod 755 "$INTENT_SCRIPT"
 ok "Created $INTENT_SCRIPT"
 
 # ── 5b. kodi_search.py ───────────────────────────────────────────────────────
@@ -525,7 +525,7 @@ if __name__ == "__main__":
 KODI_SEARCH_PY_EOF
 
 chown "$REAL_USER:$(id -gn "$REAL_USER")" "$KODI_SEARCH_SCRIPT"
-chmod 644 "$KODI_SEARCH_SCRIPT"
+chmod 755 "$KODI_SEARCH_SCRIPT"
 ok "Created $KODI_SEARCH_SCRIPT"
 
 # ── 5c. voice_trigger.sh ─────────────────────────────────────────────────────
