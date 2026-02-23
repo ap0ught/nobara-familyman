@@ -6,6 +6,7 @@
 set -euo pipefail
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
+HTPC_USER="familyman"          # main HTPC user — created if absent
 MODEL_NAME="${MODEL_NAME:-mistral}"
 RECORD_SECONDS="${RECORD_SECONDS:-5}"
 MIC_DEVICE="${MIC_DEVICE:-default}"
@@ -28,6 +29,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ─── Input validation ─────────────────────────────────────────────────────────
+if ! [[ "$RECORD_SECONDS" =~ ^[0-9]+$ ]] || [[ "$RECORD_SECONDS" -lt 1 ]] || [[ "$RECORD_SECONDS" -gt 300 ]]; then
+  echo "Error: --record-seconds must be a positive integer between 1 and 300." >&2
+  exit 1
+fi
+# Allow only safe characters for ALSA device names (alphanumeric, colon, comma, hyphen, dot)
+if [[ "$MIC_DEVICE" != "default" ]] && ! [[ "$MIC_DEVICE" =~ ^[a-zA-Z0-9_:,.-]+$ ]]; then
+  echo "Error: --mic-device contains invalid characters (allowed: a-z A-Z 0-9 _ : , . -)." >&2
+  exit 1
+fi
+if [[ "$SPEAKER_DEVICE" != "default" ]] && ! [[ "$SPEAKER_DEVICE" =~ ^[a-zA-Z0-9_:,.-]+$ ]]; then
+  echo "Error: --speaker-device contains invalid characters (allowed: a-z A-Z 0-9 _ : , . -)." >&2
+  exit 1
+fi
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 log()  { echo "[setup] $*"; }
 ok()   { echo "  ✓ $*"; }
@@ -40,9 +56,12 @@ require_root() {
   fi
 }
 
-# Determine the real (non-root) user who invoked sudo
+# Determine the real (non-root) user who invoked sudo, preferring HTPC_USER
 get_real_user() {
-  if [[ -n "${SUDO_USER:-}" ]]; then
+  # If the canonical HTPC user already exists, always use it
+  if getent passwd "$HTPC_USER" &>/dev/null; then
+    echo "$HTPC_USER"
+  elif [[ -n "${SUDO_USER:-}" ]]; then
     echo "$SUDO_USER"
   else
     # Fallback: first non-root user with a home under /home
@@ -53,9 +72,80 @@ get_real_user() {
 # ─── Pre-flight ───────────────────────────────────────────────────────────────
 require_root
 
+# ─── Step 0: Ensure familyman user exists ────────────────────────────────────
+log "=== Step 0: familyman user ==="
+
+if ! getent passwd "$HTPC_USER" &>/dev/null; then
+  useradd -m -c "Family HTPC user" -s /bin/bash "$HTPC_USER"
+  ok "Created user $HTPC_USER"
+else
+  ok "User $HTPC_USER already exists"
+fi
+
+# Add to wheel (sudo) and audio groups if not already a member
+for grp in wheel audio video; do
+  if getent group "$grp" &>/dev/null && ! id -nG "$HTPC_USER" | grep -qw "$grp"; then
+    usermod -aG "$grp" "$HTPC_USER"
+    ok "Added $HTPC_USER to group $grp"
+  fi
+done
+
+# Passwordless sudo
+SUDOERS_FILE="/etc/sudoers.d/familyman"
+if [[ ! -f "$SUDOERS_FILE" ]] || ! grep -q "^${HTPC_USER} " "$SUDOERS_FILE" 2>/dev/null; then
+  echo "${HTPC_USER} ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
+  chmod 440 "$SUDOERS_FILE"
+  ok "Passwordless sudo configured at $SUDOERS_FILE"
+else
+  ok "Passwordless sudo already configured"
+fi
+
+# Autologin — detect display manager
+_configure_autologin() {
+  local user="$1"
+
+  # SDDM (KDE / Nobara default)
+  if systemctl is-enabled --quiet sddm 2>/dev/null || [[ -d /etc/sddm.conf.d ]]; then
+    install -d /etc/sddm.conf.d
+    local sddm_conf="/etc/sddm.conf.d/autologin.conf"
+    cat > "$sddm_conf" << SDDMEOF
+[Autologin]
+User=${user}
+Session=plasma
+SDDMEOF
+    chmod 644 "$sddm_conf"
+    ok "SDDM autologin configured ($sddm_conf)"
+    return 0
+  fi
+
+  # GDM (fallback)
+  if systemctl is-enabled --quiet gdm 2>/dev/null; then
+    local gdm_conf="/etc/gdm/custom.conf"
+    if [[ -f "$gdm_conf" ]]; then
+      # Replace or insert AutomaticLogin* under [daemon]
+      sed -i.bak \
+        -e 's/^#\?AutomaticLoginEnable=.*/AutomaticLoginEnable=True/' \
+        -e 's/^#\?AutomaticLogin=.*/AutomaticLogin='"${user}"'/' \
+        "$gdm_conf"
+      # Add if not present at all
+      grep -q 'AutomaticLoginEnable' "$gdm_conf" || \
+        sed -i '/\[daemon\]/a AutomaticLoginEnable=True\nAutomaticLogin='"${user}" "$gdm_conf"
+      ok "GDM autologin configured ($gdm_conf)"
+    else
+      warn "GDM config not found at $gdm_conf; skipping autologin configuration."
+    fi
+    return 0
+  fi
+
+  warn "Neither SDDM nor GDM found; autologin not configured automatically."
+  warn "Configure autologin for user '${user}' manually in your display manager settings."
+}
+
+_configure_autologin "$HTPC_USER"
+
 REAL_USER="$(get_real_user)"
 if [[ -z "$REAL_USER" ]]; then
-  echo "Error: could not determine the real user. Run via sudo from your normal user account." >&2
+  echo "Error: could not determine the real user." >&2
   exit 1
 fi
 REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
@@ -109,6 +199,9 @@ log "=== Step 2: Ollama ==="
 
 if ! command -v ollama &>/dev/null; then
   log "Downloading and installing Ollama..."
+  # NOTE: This pipes a remote script directly to sh as root — a well-known supply-chain
+  # risk. If you prefer, install ollama from a trusted package source manually, then
+  # re-run this script. See https://github.com/ollama/ollama for alternatives.
   curl -fsSL https://ollama.com/install.sh | sh
 else
   ok "ollama already installed: $(ollama --version 2>&1 | head -1)"
@@ -126,10 +219,15 @@ fi
 sleep 2
 
 log "Pulling model: $MODEL_NAME (this may take a while on first run)..."
-if sudo -u "$REAL_USER" ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qF "${MODEL_NAME}"; then
+if sudo -u "$REAL_USER" ollama list 2>/dev/null | awk -v target="${MODEL_NAME}" '
+  NR>1 {
+    name=$1; split(name, parts, ":"); base=parts[1]
+    if (name==target || base==target) { found=1; exit }
+  }
+  END { exit !found }'; then
   ok "Model $MODEL_NAME already present"
 else
-  ollama pull "$MODEL_NAME" || warn "Failed to pull model $MODEL_NAME; will retry on first use"
+  sudo -u "$REAL_USER" ollama pull "$MODEL_NAME" || warn "Failed to pull model $MODEL_NAME; will retry on first use"
 fi
 
 # ─── 3. faster-whisper Python venv ────────────────────────────────────────────
@@ -150,6 +248,15 @@ sudo -u "$REAL_USER" "$VENV_DIR/bin/pip" install --quiet --upgrade pip
 sudo -u "$REAL_USER" "$VENV_DIR/bin/pip" install --quiet faster-whisper soundfile
 ok "faster-whisper installed in venv"
 
+# Pre-download the Whisper "base" model so the assistant works fully offline
+log "Pre-downloading Whisper 'base' model for offline use..."
+sudo -u "$REAL_USER" "$VENV_DIR/bin/python3" -c "
+from faster_whisper import WhisperModel
+print('[setup] Initialising WhisperModel (downloads on first run)...')
+WhisperModel('base', device='cpu', compute_type='int8')
+print('[setup] Whisper base model ready.')
+" || warn "Failed to pre-download Whisper model; it will be downloaded on first voice command."
+
 # ─── 4. Piper binary & voice model ───────────────────────────────────────────
 log "=== Step 4: Piper TTS ==="
 
@@ -169,9 +276,23 @@ if [[ -z "$PIPER_BIN" ]]; then
   if [[ ! -x "$PIPER_BIN" ]]; then
     log "Piper not available via DNF; downloading release binary..."
     ARCH="$(uname -m)"
-    PIPER_RELEASE_URL="https://github.com/rhasspy/piper/releases/latest/download/piper_${ARCH}.tar.gz"
+    # Pin to a specific release to avoid pulling unverified 'latest' binaries.
+    # Override PIPER_VERSION or PIPER_SHA256 before running to update/verify.
+    PIPER_VERSION="${PIPER_VERSION:-2023.11.14-2}"
+    PIPER_RELEASE_URL="https://github.com/rhasspy/piper/releases/download/${PIPER_VERSION}/piper_${ARCH}.tar.gz"
     TMP_PIPER="/tmp/piper_dl.tar.gz"
     curl -fsSL -o "$TMP_PIPER" "$PIPER_RELEASE_URL"
+    # Optional SHA256 verification — set PIPER_SHA256 before running for full supply-chain safety
+    if [[ -n "${PIPER_SHA256:-}" ]]; then
+      echo "${PIPER_SHA256}  ${TMP_PIPER}" | sha256sum -c - || {
+        rm -f "$TMP_PIPER"
+        echo "Error: piper binary checksum mismatch. Aborting." >&2
+        exit 1
+      }
+      ok "piper checksum verified"
+    else
+      warn "PIPER_SHA256 not set; skipping checksum verification. Set PIPER_SHA256=<sha256> before running for supply-chain safety."
+    fi
     tar -xzf "$TMP_PIPER" -C "$PIPER_BIN_DIR" --strip-components=1
     chmod +x "$PIPER_BIN"
     chown "$REAL_USER:$(id -gn "$REAL_USER")" "$PIPER_BIN"
@@ -219,12 +340,20 @@ VENV_DIR="${VOICE_DIR}/venv"
 PIPER_BIN="${PIPER_BIN}"
 VOICE_MODEL="${VOICES_DIR}/en_US-lessac-medium.onnx"
 
-IN_WAV="/tmp/nuc_assistant_in.wav"
-OUT_WAV="/tmp/nuc_assistant_out.wav"
-TRANSCRIPT_FILE="/tmp/nuc_assistant_transcript.txt"
+# Private temp directory — 700 so other users cannot read recorded audio/transcripts
+TMP_DIR="\${VOICE_DIR}/tmp"
+mkdir -p "\$TMP_DIR"
+chmod 700 "\$TMP_DIR"
+IN_WAV="\${TMP_DIR}/nuc_assistant_in.wav"
+OUT_WAV="\${TMP_DIR}/nuc_assistant_out.wav"
+TRANSCRIPT_FILE="\${TMP_DIR}/nuc_assistant_transcript.txt"
 
 ts() { date '+%Y-%m-%dT%H:%M:%S'; }
 logit() { echo "\$(ts) \$*" | tee -a "\$LOGFILE"; }
+
+# Clean up temp files on exit (success or error)
+cleanup() { rm -f "\$IN_WAV" "\$OUT_WAV" "\$TRANSCRIPT_FILE"; }
+trap cleanup EXIT
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\${VENV_DIR}/bin"
 
@@ -247,14 +376,18 @@ fi
 logit "[voice] Transcribing..."
 "\${VENV_DIR}/bin/python3" - <<'PYEOF' "\$IN_WAV" "\$TRANSCRIPT_FILE"
 import sys
-from faster_whisper import WhisperModel
-audio_path  = sys.argv[1]
-output_path = sys.argv[2]
-model = WhisperModel("base", device="cpu", compute_type="int8")
-segments, _ = model.transcribe(audio_path, beam_size=5)
-text = " ".join(seg.text.strip() for seg in segments)
-with open(output_path, "w") as f:
-    f.write(text)
+try:
+    from faster_whisper import WhisperModel
+    audio_path  = sys.argv[1]
+    output_path = sys.argv[2]
+    model = WhisperModel("base", device="cpu", compute_type="int8")
+    segments, _ = model.transcribe(audio_path, beam_size=5)
+    text = " ".join(seg.text.strip() for seg in segments)
+    with open(output_path, "w") as f:
+        f.write(text)
+except Exception as exc:
+    print(f"[voice] Transcription error: {exc}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
 
 TRANSCRIPT="\$(cat "\$TRANSCRIPT_FILE" 2>/dev/null || echo "")"
@@ -270,7 +403,7 @@ RESPONSE="\$(ollama run "\$MODEL_NAME" "\$TRANSCRIPT" 2>>\$LOGFILE || echo "I'm 
 logit "[voice] Response: \$RESPONSE"
 
 # 4. Speak response with Piper + aplay
-logit "[voice] Synthesising speech..."
+logit "[voice] Synthesizing speech..."
 echo "\$RESPONSE" | "\$PIPER_BIN" --model "\$VOICE_MODEL" --output_file "\$OUT_WAV" 2>>\$LOGFILE
 
 if [[ "\$SPEAKER_DEVICE" == "default" ]]; then
@@ -291,17 +424,20 @@ log "=== Step 6: systemd-logind power key ==="
 
 LOGIND_CONF="/etc/systemd/logind.conf"
 if grep -qE '^HandlePowerKey=' "$LOGIND_CONF" 2>/dev/null; then
-  sed -i 's/^HandlePowerKey=.*/HandlePowerKey=ignore/' "$LOGIND_CONF"
+  sed -i.bak 's/^HandlePowerKey=.*/HandlePowerKey=ignore/' "$LOGIND_CONF"
   ok "Updated HandlePowerKey=ignore in $LOGIND_CONF"
 elif grep -qE '^#HandlePowerKey=' "$LOGIND_CONF" 2>/dev/null; then
-  sed -i 's/^#HandlePowerKey=.*/HandlePowerKey=ignore/' "$LOGIND_CONF"
+  sed -i.bak 's/^#HandlePowerKey=.*/HandlePowerKey=ignore/' "$LOGIND_CONF"
   ok "Uncommented and set HandlePowerKey=ignore in $LOGIND_CONF"
 else
   echo "HandlePowerKey=ignore" >> "$LOGIND_CONF"
   ok "Appended HandlePowerKey=ignore to $LOGIND_CONF"
 fi
 
-systemctl restart systemd-logind || warn "Could not restart systemd-logind (this is usually OK in a live session)"
+warn "About to restart systemd-logind. This will terminate the current login session."
+warn "Press Ctrl+C within 10 seconds to cancel."
+sleep 10
+systemctl restart systemd-logind || warn "Could not restart systemd-logind; you may need to reboot for power-button changes to take effect."
 
 # Notify about KDE powerdevil if present
 if [[ -f "$REAL_HOME/.config/powerdevilrc" ]] || command -v org_kde_powerdevil &>/dev/null; then
@@ -323,6 +459,8 @@ ACPI_EVENTS_DIR="/etc/acpi/events"
 install -d "$ACPI_EVENTS_DIR"
 
 ACPI_EVENT_FILE="$ACPI_EVENTS_DIR/nuc-voice-assistant"
+# Note: re-running setup.sh will overwrite this file.
+# Pass --event 'your event string' to customise the match.
 cat > "$ACPI_EVENT_FILE" << EVENTEOF
 # NUC power button → voice assistant (managed by setup.sh)
 event=${ACPI_EVENT_MATCH}
@@ -336,7 +474,7 @@ cat > "$ACPI_ACTION" << ACTIONEOF
 #!/usr/bin/env bash
 # ACPI action: power button → voice assistant
 # Called by acpid as root; uses flock to prevent overlapping invocations.
-LOCK_FILE="/tmp/nuc-voice-assistant.lock"
+LOCK_FILE="/run/lock/nuc-voice-assistant.lock"
 REAL_USER="${REAL_USER}"
 VOICE_DIR="${VOICE_DIR}"
 LOGFILE="${LOGFILE}"
@@ -347,6 +485,12 @@ logit() { echo "\$(ts) \$*" >> "\$LOGFILE"; }
 
 logit "[acpi] Power button event: \$*"
 
+# Guard: user must be logged in (XDG_RUNTIME_DIR must exist for audio to work)
+if [[ ! -d "\$XDG_RUNTIME_DIR" ]]; then
+  logit "[acpi] XDG_RUNTIME_DIR '\$XDG_RUNTIME_DIR' does not exist; '\$REAL_USER' may not be logged in. Aborting."
+  exit 0
+fi
+
 # Prevent overlapping runs
 exec 9>"\$LOCK_FILE"
 if ! flock -n 9; then
@@ -356,6 +500,7 @@ fi
 
 logit "[acpi] Launching voice_trigger.sh as \$REAL_USER"
 export XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR"
+# Run in background so acpid is not blocked; logging is fully redirected.
 sudo -u "\$REAL_USER" \
   XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR" \
   "\$VOICE_DIR/voice_trigger.sh" >> "\$LOGFILE" 2>&1 &
@@ -432,8 +577,11 @@ echo -n "  voice model     ... "
 
 # 7. LLM prompt test
 echo "  LLM test prompt ..."
-RESPONSE="\$(ollama run "\$MODEL_NAME" "Reply only: test OK" 2>/dev/null | head -1)"
-echo "    LLM reply: \$RESPONSE"
+if RESPONSE="\$(ollama run "\$MODEL_NAME" "Reply only: test OK" 2>/dev/null)" && [[ -n "\$RESPONSE" ]]; then
+  echo "    LLM reply: \$(echo "\$RESPONSE" | head -1) ✓"
+else
+  echo "  ✗ LLM test FAILED (empty or error response)"; exit 1
+fi
 
 # 8. TTS + playback test
 echo "  TTS test ..."
@@ -456,6 +604,7 @@ ok "Created $TEST_CMD"
 log "=== Step 9: Log file ==="
 touch "$LOGFILE"
 chmod 664 "$LOGFILE"
+chown "$REAL_USER:$(id -gn "$REAL_USER")" "$LOGFILE"
 echo "$(date '+%Y-%m-%dT%H:%M:%S') [setup] Installation complete." >> "$LOGFILE"
 ok "Log file ready: $LOGFILE"
 
