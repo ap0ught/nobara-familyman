@@ -1,5 +1,14 @@
 # nobara-familyman
 
+A collection of idempotent setup scripts that turn a fresh **Nobara HTPC** (Intel NUC8i7HNK) into a multi-purpose home appliance.
+
+| Plan | Script | Description |
+|------|--------|-------------|
+| [Plan 1 — HTPC / Fire TV Cube replacement](#architecture) | `setup.sh` | Steam Gamepad UI + voice-controlled Kodi + local AI |
+| [Plan 2 — MagicMirror²](#plan-2--magicmirror-for-63021) | `setup-magicmirror.sh` | Fullscreen smart-mirror display for zip 63021 (Ballwin, MO) |
+
+---
+
 Idempotent setup script that turns a fresh **Nobara HTPC** (Intel NUC8i7HNK) into a **Fire TV Cube replacement** — a clean, controller-first Linux appliance that boots directly into the Steam Gamepad UI, supports voice-triggered Kodi playback, emulation, and local AI, with no visible desktop.
 
 ## Architecture
@@ -292,3 +301,118 @@ sudo userdel -r familyman
 
 # Stop and uninstall Ollama (see https://github.com/ollama/ollama for instructions)
 ```
+
+---
+
+## Plan 2 — MagicMirror² for 63021
+
+Turn the NUC into a fullscreen smart-mirror / home info panel pre-configured for the **63021** zip-code area (Ballwin, MO).
+
+### Architecture
+
+```
+Boot
+  ↓
+Auto Login (familyman)
+  ↓
+Minimal KDE session
+  ↓
+MagicMirror² fullscreen (Electron)
+  ↓
+Modules auto-refresh
+```
+
+### Quick Start
+
+```bash
+sudo ./setup-magicmirror.sh
+```
+
+Then edit `~/MagicMirror/config/config.js` to set your API key and calendar URL.
+
+Re-running is safe — the script is fully **idempotent**.
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--user NAME` | `familyman` | HTPC user that will run MagicMirror² |
+| `--api-key KEY` | `YOUR_API_KEY` | OpenWeatherMap API key |
+| `--calendar-url URL` | `YOUR_ICS_URL` | Google/iCal `.ics` calendar feed URL |
+| `--location-id ID` | `4387778` | OpenWeatherMap city ID (default: Ballwin, MO) |
+| `--location NAME` | `Ballwin` | Human-readable location name shown in config |
+
+Environment variables (`OPENWEATHER_API_KEY`, `CALENDAR_URL`, `LOCATION_ID`, `LOCATION_NAME`) are also honoured.
+
+Example with credentials:
+
+```bash
+OPENWEATHER_API_KEY=abc123 CALENDAR_URL=https://calendar.google.com/... \
+  sudo ./setup-magicmirror.sh
+```
+
+### What the Script Does
+
+1. **System deps** — installs `git`, `curl`, `nodejs`, `npm`, and `unclutter` (if available) via `dnf`
+2. **MagicMirror² source** — clones (or updates) the repo into `~/MagicMirror`
+3. **npm install** — installs all MagicMirror² Node dependencies (including Electron)
+4. **config/config.js** — writes a ready-to-use config pre-set for 63021 (Ballwin, MO):
+   - 12-hour clock, imperial units, US English locale
+   - Current weather + 5-day forecast via OpenWeatherMap
+   - Calendar module (iCal URL)
+   - News feed (Reuters)
+   - Compliments module
+5. **Fullscreen mode** — patches `package.json` to add `--fullscreen --no-sandbox` to the Electron start command
+6. **KDE autostart entries** (in `~/.config/autostart/`):
+   - `magicmirror.desktop` — starts MagicMirror² on login
+   - `unclutter.desktop` — hides the mouse cursor (if unclutter is installed)
+   - `disable-screensaver.desktop` — disables screen blanking via `xset`
+
+### Post-Install Configuration
+
+Edit the config file to supply real credentials:
+
+```bash
+nano ~/MagicMirror/config/config.js
+```
+
+Replace:
+
+```js
+apiKey: "YOUR_API_KEY"   // ← your OpenWeatherMap API key
+url: "YOUR_ICS_URL"      // ← your Google/iCal .ics URL
+```
+
+Get a free OpenWeatherMap API key at <https://openweathermap.org/api>.
+
+### Test Run
+
+```bash
+sudo -u familyman npm start --prefix ~/MagicMirror
+```
+
+### Files Created / Modified
+
+| Path | Description |
+|------|-------------|
+| `~/MagicMirror/` | MagicMirror² application |
+| `~/MagicMirror/config/config.js` | Mirror config (clock, weather, calendar, news) |
+| `~/.config/autostart/magicmirror.desktop` | KDE autostart entry |
+| `~/.config/autostart/unclutter.desktop` | Cursor-hiding autostart entry (if unclutter available) |
+| `~/.config/autostart/disable-screensaver.desktop` | Screen-blanking prevention autostart entry |
+
+### Dual-Mode (Steam + Mirror)
+
+To run both Steam HTPC mode and MagicMirror mode on the same NUC:
+
+- **Two users**: create `htpc` (Steam autologin) and `mirror` (MagicMirror autologin), switch via user accounts.
+- **Boot script**: detect connected display orientation and launch the appropriate mode.
+- **Voice trigger**: integrate with Plan 1 — a voice command kills Steam and launches MagicMirror (or vice versa).
+
+### Requirements
+
+- Nobara Linux (Fedora-based, uses `dnf`)
+- Internet access during setup (to clone MagicMirror² and install npm packages)
+- A display connected to the NUC
+- Root access (`sudo`)
+- `familyman` user must already exist (run `setup.sh` first, or pass `--user <name>`)
