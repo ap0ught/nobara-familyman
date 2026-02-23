@@ -67,7 +67,7 @@ sudo ./setup.sh --event 'button/power PBTN 00000080 00000000'
 2. **Ollama** — installs via official script, enables systemd service, pulls the chosen model
 3. **faster-whisper venv** — creates `~/voice_assistant/venv`, installs `faster-whisper`, and **pre-downloads the Whisper `base` model** so the assistant runs fully offline after setup
 4. **Piper TTS** — uses distro package if available; otherwise downloads a pinned release binary (see `PIPER_VERSION`) and the `en_US-lessac-medium` voice model from HuggingFace
-5. **voice_trigger.sh** — deploys `~/voice_assistant/voice_trigger.sh` (record → transcribe → LLM → speak); audio files are kept in a private `~/voice_assistant/tmp/` directory (mode 700) and deleted after each run; LLM query has a 60-second timeout to prevent the pipeline hanging
+5. **voice_trigger.sh** — deploys `~/voice_assistant/voice_trigger.sh` (record → transcribe → LLM → speak); audio files are kept in a private `~/voice_assistant/tmp/` directory (mode 700) and deleted after each run; LLM query uses a configurable timeout (default 60 seconds, see `--llm-timeout`) to prevent the pipeline hanging
 6. **Power button** — sets `HandlePowerKey=ignore` in `/etc/systemd/logind.conf` (backup saved as `.bak`) — warns before restarting `systemd-logind` as it will end the current session
 7. **ACPI binding** — creates `/etc/acpi/events/nuc-voice-assistant` and `/etc/acpi/nuc-voice-assistant.sh` with `flock` (lock file in `/run/lock/`) to prevent overlapping invocations; checks that the user is logged in before starting the pipeline
 8. **Test command** — installs `/usr/local/bin/nuc-voice-test`
@@ -118,7 +118,7 @@ sudo tail -f /var/log/nuc-voice-assistant.log
 
 ## Security Considerations
 
-- **Passwordless sudo for `familyman`** — the script grants `familyman ALL=(ALL) NOPASSWD:ALL` so the ACPI pipeline (which runs as root via `acpid`) can launch the voice assistant as the right user.  This is appropriate for a dedicated kiosk/HTPC that boots directly to a single user, but is overly broad for shared machines.  If you prefer a tighter policy, replace the sudoers rule with specific commands after setup:
+- **Passwordless sudo for `familyman`** — the script grants `familyman ALL=(ALL) NOPASSWD:ALL` for HTPC convenience (so the desktop user can manage the system without password prompts).  This is **not** required for the voice-assistant pipeline itself — `acpid` runs as root and calls `sudo -u familyman` directly, which does not need `familyman` to hold any sudo rights.  This broad grant is appropriate for a single-user kiosk, but on any shared or security-sensitive machine you should replace it with a minimal policy after setup:
 
   ```
   familyman ALL=(ALL) NOPASSWD: /home/familyman/voice_assistant/voice_trigger.sh
@@ -179,8 +179,12 @@ sudo systemctl disable acpid          # only if you didn't use acpid before setu
 sudo rm -f /etc/acpi/events/nuc-voice-assistant /etc/acpi/nuc-voice-assistant.sh
 sudo systemctl restart acpid
 
-# Restore logind power-button handling
-sudo sed -i 's/^HandlePowerKey=ignore/HandlePowerKey=poweroff/' /etc/systemd/logind.conf
+# Restore logind power-button handling (prefer the backup written by setup.sh)
+if [ -f /etc/systemd/logind.conf.bak ]; then
+  sudo mv /etc/systemd/logind.conf.bak /etc/systemd/logind.conf
+else
+  sudo sed -i 's/^HandlePowerKey=ignore/HandlePowerKey=poweroff/' /etc/systemd/logind.conf
+fi
 sudo systemctl restart systemd-logind
 
 # Remove sudoers file

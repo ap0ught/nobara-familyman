@@ -20,14 +20,22 @@ PIPER_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_
 PIPER_JSON_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
+_require_arg() {
+  if [[ $# -lt 2 || -z "${2-}" ]]; then
+    echo "Error: $1 requires an argument." >&2
+    echo "Run with --help for usage." >&2
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --event)         ACPI_EVENT_MATCH="$2"; shift 2 ;;
-    --model)         MODEL_NAME="$2"; shift 2 ;;
-    --record-seconds) RECORD_SECONDS="$2"; shift 2 ;;
-    --llm-timeout)   LLM_TIMEOUT="$2"; shift 2 ;;
-    --mic-device)    MIC_DEVICE="$2"; shift 2 ;;
-    --speaker-device) SPEAKER_DEVICE="$2"; shift 2 ;;
+    --event)         _require_arg "$@"; ACPI_EVENT_MATCH="$2"; shift 2 ;;
+    --model)         _require_arg "$@"; MODEL_NAME="$2"; shift 2 ;;
+    --record-seconds) _require_arg "$@"; RECORD_SECONDS="$2"; shift 2 ;;
+    --llm-timeout)   _require_arg "$@"; LLM_TIMEOUT="$2"; shift 2 ;;
+    --mic-device)    _require_arg "$@"; MIC_DEVICE="$2"; shift 2 ;;
+    --speaker-device) _require_arg "$@"; SPEAKER_DEVICE="$2"; shift 2 ;;
     --help|-h)
       cat << 'HELPEOF'
 Usage: sudo ./setup.sh [OPTIONS]
@@ -38,7 +46,7 @@ Re-running is safe — all steps are idempotent.
 Options:
   --model NAME           Ollama model to pull and use            (default: mistral)
   --record-seconds N     Seconds of audio to capture per press   (default: 5, max: 300)
-  --llm-timeout N        Seconds to wait for an LLM response     (default: 60)
+  --llm-timeout N        Seconds to wait for an LLM response     (default: 60, range: 1-3600)
   --event 'STRING'       ACPI event match string                 (default: button/power.*)
   --mic-device DEVICE    ALSA capture device, e.g. hw:1,0        (default: default)
   --speaker-device DEV   ALSA playback device, e.g. hw:1,0       (default: default)
@@ -125,7 +133,11 @@ for grp in wheel audio video; do
   fi
 done
 
-# Passwordless sudo
+# Passwordless sudo — grants familyman full root access for HTPC convenience
+# (e.g. managing the system from the desktop without a password prompt).
+# The ACPI pipeline does NOT require this — acpid runs as root and uses
+# 'sudo -u familyman' directly. See the Security Considerations section of
+# README.md if you prefer a more restricted policy.
 SUDOERS_FILE="/etc/sudoers.d/familyman"
 if [[ ! -f "$SUDOERS_FILE" ]] || ! grep -q "^${HTPC_USER} " "$SUDOERS_FILE" 2>/dev/null; then
   echo "${HTPC_USER} ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
@@ -235,10 +247,26 @@ log "=== Step 2: Ollama ==="
 
 if ! command -v ollama &>/dev/null; then
   log "Downloading and installing Ollama..."
-  # NOTE: This pipes a remote script directly to sh as root — a well-known supply-chain
-  # risk. If you prefer, install ollama from a trusted package source manually, then
+  # NOTE: This executes a remote installer script as root — a well-known supply-chain
+  # risk. If you prefer, install Ollama from a trusted package source manually, then
   # re-run this script. See https://github.com/ollama/ollama for alternatives.
-  curl -fsSL https://ollama.com/install.sh | sh
+  # The script is saved to disk first so you can inspect it before it runs;
+  # set OLLAMA_SHA256=<hash> to verify integrity before execution.
+  OLLAMA_INSTALLER="/tmp/ollama_install.sh"
+  curl -fsSL -o "$OLLAMA_INSTALLER" https://ollama.com/install.sh
+  if [[ -n "${OLLAMA_SHA256:-}" ]]; then
+    echo "${OLLAMA_SHA256}  ${OLLAMA_INSTALLER}" | sha256sum -c - || {
+      rm -f "$OLLAMA_INSTALLER"
+      echo "Error: Ollama installer checksum mismatch. Aborting." >&2
+      exit 1
+    }
+    ok "Ollama installer checksum verified"
+  else
+    warn "OLLAMA_SHA256 not set; skipping installer checksum verification."
+    warn "To verify, inspect $OLLAMA_INSTALLER before proceeding or set OLLAMA_SHA256=<hash>."
+  fi
+  sh "$OLLAMA_INSTALLER"
+  rm -f "$OLLAMA_INSTALLER"
 else
   ok "ollama already installed: $(ollama --version 2>&1 | head -1)"
 fi
