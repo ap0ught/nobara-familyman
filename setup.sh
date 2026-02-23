@@ -3,6 +3,7 @@
 # Usage:  sudo ./setup.sh [--event 'button/power PBTN 00000080 00000000']
 #                         [--model mistral]  [--record-seconds 5]
 #                         [--mic-device hw:0,0] [--speaker-device hw:0,0]
+#                         [--llm-timeout 60]
 #                         [--tv-width 3840] [--tv-height 2160]
 #                         [--render-width 1920] [--render-height 1080]
 #                         [--framerate 60]
@@ -16,6 +17,7 @@ MODEL_NAME="${MODEL_NAME:-mistral}"
 RECORD_SECONDS="${RECORD_SECONDS:-5}"
 MIC_DEVICE="${MIC_DEVICE:-default}"
 SPEAKER_DEVICE="${SPEAKER_DEVICE:-default}"
+LLM_TIMEOUT="${LLM_TIMEOUT:-60}"
 ACPI_EVENT_MATCH="button/power.*"
 LOGFILE="/var/log/nuc-voice-assistant.log"
 VOICE_DIR=""          # resolved after we know the real user
@@ -34,22 +36,71 @@ KODI_USER="${KODI_USER:-kodi}"
 KODI_PASS="${KODI_PASS:-kodi}"
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
+_require_arg() {
+  if [[ $# -lt 2 || -z "${2-}" ]]; then
+    echo "Error: $1 requires an argument." >&2
+    echo "Run with --help for usage." >&2
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --event)          ACPI_EVENT_MATCH="$2"; shift 2 ;;
-    --model)          MODEL_NAME="$2"; shift 2 ;;
-    --record-seconds) RECORD_SECONDS="$2"; shift 2 ;;
-    --mic-device)     MIC_DEVICE="$2"; shift 2 ;;
-    --speaker-device) SPEAKER_DEVICE="$2"; shift 2 ;;
-    --tv-width)       TV_WIDTH="$2"; shift 2 ;;
-    --tv-height)      TV_HEIGHT="$2"; shift 2 ;;
-    --render-width)   RENDER_WIDTH="$2"; shift 2 ;;
-    --render-height)  RENDER_HEIGHT="$2"; shift 2 ;;
-    --framerate)      FRAMERATE="$2"; shift 2 ;;
-    --kodi-host)      KODI_HOST="$2"; shift 2 ;;
-    --kodi-port)      KODI_PORT="$2"; shift 2 ;;
-    --kodi-user)      KODI_USER="$2"; shift 2 ;;
-    --kodi-pass)      KODI_PASS="$2"; shift 2 ;;
+    --event)          _require_arg "$@"; ACPI_EVENT_MATCH="$2"; shift 2 ;;
+    --model)          _require_arg "$@"; MODEL_NAME="$2"; shift 2 ;;
+    --record-seconds) _require_arg "$@"; RECORD_SECONDS="$2"; shift 2 ;;
+    --llm-timeout)    _require_arg "$@"; LLM_TIMEOUT="$2"; shift 2 ;;
+    --mic-device)     _require_arg "$@"; MIC_DEVICE="$2"; shift 2 ;;
+    --speaker-device) _require_arg "$@"; SPEAKER_DEVICE="$2"; shift 2 ;;
+    --tv-width)       _require_arg "$@"; TV_WIDTH="$2"; shift 2 ;;
+    --tv-height)      _require_arg "$@"; TV_HEIGHT="$2"; shift 2 ;;
+    --render-width)   _require_arg "$@"; RENDER_WIDTH="$2"; shift 2 ;;
+    --render-height)  _require_arg "$@"; RENDER_HEIGHT="$2"; shift 2 ;;
+    --framerate)      _require_arg "$@"; FRAMERATE="$2"; shift 2 ;;
+    --kodi-host)      _require_arg "$@"; KODI_HOST="$2"; shift 2 ;;
+    --kodi-port)      _require_arg "$@"; KODI_PORT="$2"; shift 2 ;;
+    --kodi-user)      _require_arg "$@"; KODI_USER="$2"; shift 2 ;;
+    --kodi-pass)      _require_arg "$@"; KODI_PASS="$2"; shift 2 ;;
+    --help|-h)
+      cat << 'HELPEOF'
+Usage: sudo ./setup.sh [OPTIONS]
+
+Idempotent NUC HTPC installer for Nobara (voice assistant + Steam shell + Kodi).
+Re-running is safe — all steps are idempotent.
+
+Options:
+  --model NAME           Ollama model to pull and use            (default: mistral)
+  --record-seconds N     Seconds of audio to capture per press   (default: 5, max: 300)
+  --llm-timeout N        Seconds to wait for an LLM response     (default: 60, range: 1-3600)
+  --event 'STRING'       ACPI event match string                 (default: button/power.*)
+  --mic-device DEVICE    ALSA capture device, e.g. hw:1,0        (default: default)
+  --speaker-device DEV   ALSA playback device, e.g. hw:1,0       (default: default)
+  --tv-width W           TV output width  (gamescope -W)          (default: 3840)
+  --tv-height H          TV output height (gamescope -H)          (default: 2160)
+  --render-width W       Internal render width  (gamescope -w)    (default: 1920)
+  --render-height H      Internal render height (gamescope -h)    (default: 1080)
+  --framerate R          Target frame rate (gamescope -r)         (default: 60)
+  --kodi-host HOST       Kodi JSON-RPC hostname                   (default: localhost)
+  --kodi-port PORT       Kodi JSON-RPC port                       (default: 8080)
+  --kodi-user USER       Kodi JSON-RPC username                   (default: kodi)
+  --kodi-pass PASS       Kodi JSON-RPC password                   (env: KODI_PASS; Kodi ships with its own default)
+  --help, -h             Show this help and exit
+
+Environment variables (override defaults before running):
+  MODEL_NAME, RECORD_SECONDS, LLM_TIMEOUT, MIC_DEVICE, SPEAKER_DEVICE
+  TV_WIDTH, TV_HEIGHT, RENDER_WIDTH, RENDER_HEIGHT, FRAMERATE
+  KODI_HOST, KODI_PORT, KODI_USER, KODI_PASS
+  PIPER_VERSION   Piper release tag to download  (default: 2023.11.14-2)
+  PIPER_SHA256    Expected SHA-256 of the Piper tarball (recommended for security)
+
+Examples:
+  sudo ./setup.sh
+  sudo ./setup.sh --model llama3 --record-seconds 8 --llm-timeout 120
+  sudo ./setup.sh --event 'button/power PBTN 00000080 00000000'
+  sudo ./setup.sh --kodi-host 192.168.1.10 --kodi-port 8080
+  PIPER_VERSION=2023.11.14-2 PIPER_SHA256=<hash> sudo ./setup.sh
+HELPEOF
+      exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -57,6 +108,10 @@ done
 # ─── Input validation ─────────────────────────────────────────────────────────
 if ! [[ "$RECORD_SECONDS" =~ ^[0-9]+$ ]] || [[ "$RECORD_SECONDS" -lt 1 ]] || [[ "$RECORD_SECONDS" -gt 300 ]]; then
   echo "Error: --record-seconds must be a positive integer between 1 and 300." >&2
+  exit 1
+fi
+if ! [[ "$LLM_TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$LLM_TIMEOUT" -lt 1 ]] || [[ "$LLM_TIMEOUT" -gt 3600 ]]; then
+  echo "Error: --llm-timeout must be a positive integer between 1 and 3600." >&2
   exit 1
 fi
 # Allow only safe characters for ALSA device names (alphanumeric, colon, comma, hyphen, dot)
@@ -126,14 +181,18 @@ for grp in wheel audio video; do
   fi
 done
 
-# Passwordless sudo
+# No-password sudo — grants familyman full root access for HTPC convenience
+# (e.g. managing the system from the desktop without an auth prompt).
+# The ACPI pipeline does NOT require this — acpid runs as root and uses
+# 'sudo -u familyman' directly. See the Security Considerations section of
+# README.md if you prefer a more restricted policy.
 SUDOERS_FILE="/etc/sudoers.d/familyman"
 if [[ ! -f "$SUDOERS_FILE" ]] || ! grep -q "^${HTPC_USER} " "$SUDOERS_FILE" 2>/dev/null; then
   echo "${HTPC_USER} ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
   chmod 440 "$SUDOERS_FILE"
-  ok "Passwordless sudo configured at $SUDOERS_FILE"
+  ok "No-password sudo configured at $SUDOERS_FILE"
 else
-  ok "Passwordless sudo already configured"
+  ok "No-password sudo already configured"
 fi
 
 # Autologin — detect display manager
@@ -191,6 +250,7 @@ log "Installing for user: $REAL_USER (home: $REAL_HOME)"
 log "Voice-assistant dir: $VOICE_DIR"
 log "LLM model          : $MODEL_NAME"
 log "Record seconds     : $RECORD_SECONDS"
+log "LLM timeout        : $LLM_TIMEOUT"
 log "ACPI event match   : $ACPI_EVENT_MATCH"
 log "TV resolution      : ${TV_WIDTH}x${TV_HEIGHT} (render ${RENDER_WIDTH}x${RENDER_HEIGHT} @ ${FRAMERATE}fps)"
 log "Kodi JSON-RPC      : http://${KODI_HOST}:${KODI_PORT}"
@@ -259,10 +319,26 @@ log "=== Step 2: Ollama ==="
 
 if ! command -v ollama &>/dev/null; then
   log "Downloading and installing Ollama..."
-  # NOTE: This pipes a remote script directly to sh as root — a well-known supply-chain
-  # risk. If you prefer, install ollama from a trusted package source manually, then
+  # NOTE: This executes a remote installer script as root — a well-known supply-chain
+  # risk. If you prefer, install Ollama from a trusted package source manually, then
   # re-run this script. See https://github.com/ollama/ollama for alternatives.
-  curl -fsSL https://ollama.com/install.sh | sh
+  # The script is saved to disk first so you can inspect it before it runs;
+  # set OLLAMA_SHA256=<hash> to verify integrity before execution.
+  OLLAMA_INSTALLER="/tmp/ollama_install.sh"
+  curl -fsSL -o "$OLLAMA_INSTALLER" https://ollama.com/install.sh
+  if [[ -n "${OLLAMA_SHA256:-}" ]]; then
+    echo "${OLLAMA_SHA256}  ${OLLAMA_INSTALLER}" | sha256sum -c - || {
+      rm -f "$OLLAMA_INSTALLER"
+      echo "Error: Ollama installer checksum mismatch. Aborting." >&2
+      exit 1
+    }
+    ok "Ollama installer checksum verified"
+  else
+    warn "OLLAMA_SHA256 not set; skipping installer checksum verification."
+    warn "To verify, inspect $OLLAMA_INSTALLER before proceeding or set OLLAMA_SHA256=<hash>."
+  fi
+  sh "$OLLAMA_INSTALLER"
+  rm -f "$OLLAMA_INSTALLER"
 else
   ok "ollama already installed: $(ollama --version 2>&1 | head -1)"
 fi
@@ -399,12 +475,13 @@ import sys
 
 def main() -> None:
     if len(sys.argv) < 4:
-        print(f"Usage: {sys.argv[0]} <transcript> <model> <out_json_path>", file=sys.stderr)
+        print(f"Usage: {sys.argv[0]} <transcript> <model> <out_json_path> [llm_timeout_secs]", file=sys.stderr)
         sys.exit(1)
 
-    transcript = sys.argv[1]
-    model      = sys.argv[2]
-    out_path   = sys.argv[3]
+    transcript  = sys.argv[1]
+    model       = sys.argv[2]
+    out_path    = sys.argv[3]
+    llm_timeout = int(sys.argv[4]) if len(sys.argv) > 4 else 30
 
     prompt = (
         "You are a smart-home media controller. Parse the voice command below "
@@ -425,7 +502,7 @@ def main() -> None:
 
     result = subprocess.run(
         ["ollama", "run", model, prompt],
-        capture_output=True, text=True, timeout=30
+        capture_output=True, text=True, timeout=llm_timeout
     )
     if result.returncode != 0:
         err_text = (result.stderr or "").strip()
@@ -558,6 +635,7 @@ set -euo pipefail
 
 MODEL_NAME="${MODEL_NAME}"
 RECORD_SECONDS="${RECORD_SECONDS}"
+LLM_TIMEOUT="${LLM_TIMEOUT}"
 MIC_DEVICE="${MIC_DEVICE}"
 SPEAKER_DEVICE="${SPEAKER_DEVICE}"
 LOGFILE="${LOGFILE}"
@@ -649,7 +727,7 @@ logit "[voice] Transcript: \$TRANSCRIPT"
 # 3. Intent detection via Ollama
 logit "[voice] Detecting intent (model: \$MODEL_NAME)..."
 "\${VENV_DIR}/bin/python3" "\${VOICE_DIR}/intent_detect.py" \
-  "\$TRANSCRIPT" "\$MODEL_NAME" "\$INTENT_FILE" 2>>\$LOGFILE || \
+  "\$TRANSCRIPT" "\$MODEL_NAME" "\$INTENT_FILE" "\$LLM_TIMEOUT" 2>>\$LOGFILE || \
   echo '{"action":"answer","response":"I could not process that request."}' > "\$INTENT_FILE"
 
 INTENT_JSON="\$(cat "\$INTENT_FILE" 2>/dev/null || echo '{"action":"answer","response":"I could not process that request."}')"
@@ -720,6 +798,7 @@ case "\$ACTION" in
       "\$INTENT_JSON" 2>/dev/null || echo "I am not sure about that.")"
     ;;
 esac
+
 
 logit "[voice] Response: \$RESPONSE"
 
@@ -854,6 +933,7 @@ set -euo pipefail
 
 HTPC_USER="${REAL_USER}"
 MODEL_NAME="${MODEL_NAME}"
+LLM_TIMEOUT="${LLM_TIMEOUT}"
 LOGFILE="${LOGFILE}"
 VOICE_DIR="${VOICE_DIR}"
 VENV_DIR="${VOICE_DIR}/venv"
@@ -940,7 +1020,7 @@ echo -n "  voice model     ... "
 
 # 10. LLM prompt test
 echo "  LLM test prompt ..."
-if RESPONSE="\$(ollama run "\$MODEL_NAME" "Reply only: test OK" 2>/dev/null)" && [[ -n "\$RESPONSE" ]]; then
+if RESPONSE="\$(timeout "\$LLM_TIMEOUT" ollama run "\$MODEL_NAME" "Reply only: test OK" 2>/dev/null)" && [[ -n "\$RESPONSE" ]]; then
   echo "    LLM reply: \$(echo "\$RESPONSE" | head -1) ✓"
 else
   echo "  ✗ LLM test FAILED (empty or error response)"; exit 1
