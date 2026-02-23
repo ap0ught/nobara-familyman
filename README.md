@@ -48,11 +48,12 @@ The voice-assistant pipeline always runs as `familyman`, regardless of which acc
 |------|---------|-------------|
 | `--model NAME` | `mistral` | Ollama model to pull and use |
 | `--record-seconds N` | `5` | Seconds of audio to capture per press |
+| `--llm-timeout N` | `60` | Seconds to wait for an LLM response (1–3600) |
 | `--event 'STRING'` | `button/power.*` | Exact ACPI event match string |
 | `--mic-device DEVICE` | `default` | ALSA capture device (e.g. `hw:1,0`) |
 | `--speaker-device DEVICE` | `default` | ALSA playback device |
 
-Environment variables (`MODEL_NAME`, `RECORD_SECONDS`, `MIC_DEVICE`, `SPEAKER_DEVICE`) are also honoured and can override defaults before running the script.
+Environment variables (`MODEL_NAME`, `RECORD_SECONDS`, `LLM_TIMEOUT`, `MIC_DEVICE`, `SPEAKER_DEVICE`) are also honoured and can override defaults before running the script.
 
 To pin the Piper binary to a specific version and verify its integrity:
 
@@ -77,10 +78,11 @@ sudo ./setup.sh --event 'button/power PBTN 00000080 00000000'
 2. **Ollama** — installs via official script, enables systemd service, pulls the chosen model
 3. **faster-whisper venv** — creates `~/voice_assistant/venv`, installs `faster-whisper`, and **pre-downloads the Whisper `base` model** so the assistant runs fully offline after setup
 4. **Piper TTS** — uses distro package if available; otherwise downloads a pinned release binary (see `PIPER_VERSION`) and the `en_US-lessac-medium` voice model from HuggingFace
-5. **voice_trigger.sh** — deploys `~/voice_assistant/voice_trigger.sh` (record → transcribe → LLM → speak); audio files are kept in a private `~/voice_assistant/tmp/` directory (mode 700) and deleted after each run
+5. **voice_trigger.sh** — deploys `~/voice_assistant/voice_trigger.sh` (record → transcribe → LLM → speak); audio files are kept in a private `~/voice_assistant/tmp/` directory (mode 700) and deleted after each run; LLM query uses a configurable timeout (default 60 seconds, see `--llm-timeout`) to prevent the pipeline hanging
 6. **Power button** — sets `HandlePowerKey=ignore` in `/etc/systemd/logind.conf` (backup saved as `.bak`) — warns before restarting `systemd-logind` as it will end the current session
 7. **ACPI binding** — creates `/etc/acpi/events/nuc-voice-assistant` and `/etc/acpi/nuc-voice-assistant.sh` with `flock` (lock file in `/run/lock/`) to prevent overlapping invocations; checks that the user is logged in before starting the pipeline
 8. **Test command** — installs `/usr/local/bin/nuc-voice-test`
+9. **Log file** — initialises `/var/log/nuc-voice-assistant.log` (owned by `familyman`, mode 664) and appends a timestamped installation record
 
 ## Files Created / Modified
 
@@ -124,6 +126,95 @@ sudo tail -f /var/log/nuc-voice-assistant.log
 - Internet access during setup (to download Ollama, the LLM model, the Piper voice, and the Whisper model)
 - A microphone and speaker/headphone output
 - Root access (`sudo`)
+
+## Security Considerations
+
+- **Passwordless sudo for `familyman`** — the script grants `familyman ALL=(ALL) NOPASSWD:ALL` for HTPC convenience (so the desktop user can manage the system without password prompts).  This is **not** required for the voice-assistant pipeline itself — `acpid` runs as root and calls `sudo -u familyman` directly, which does not need `familyman` to hold any sudo rights.  This broad grant is appropriate for a single-user kiosk, but on any shared or security-sensitive machine you should replace it with a minimal policy after setup:
+
+  ```
+  familyman ALL=(ALL) NOPASSWD: /home/familyman/voice_assistant/voice_trigger.sh
+  ```
+
+- **Ollama installer piped to `sh`** — `curl … | sh` is a common install pattern but carries supply-chain risk.  The comment in the script explains this; consider installing Ollama from a trusted package source first and then re-running `setup.sh`.
+
+- **Piper binary checksum** — set `PIPER_SHA256` before running to verify the downloaded tarball:
+
+  ```bash
+  PIPER_VERSION=2023.11.14-2 PIPER_SHA256=<sha256sum> sudo ./setup.sh
+  ```
+
+- **Audio recordings** — captured WAV files are stored in `~/voice_assistant/tmp/` (mode 700) and deleted immediately after each run; transcripts follow the same lifecycle.
+
+## Troubleshooting
+
+**Power button press does nothing**
+
+1. Check that `acpid` is running: `systemctl status acpid`
+2. Capture the exact event string: `sudo acpi_listen` (then press the power button)
+3. If it differs from `button/power.*`, re-run with: `sudo ./setup.sh --event '<paste line>'`
+
+**"XDG_RUNTIME_DIR does not exist" in the log**
+
+The `familyman` user must be logged in before the pipeline can produce audio.  Ensure autologin is enabled (the script configures SDDM or GDM) and that the user session has started.
+
+**LLM response times out or is empty**
+
+- Confirm the Ollama service is running: `systemctl status ollama`
+- Test manually: `ollama run mistral "hello"` (substitute your model name)
+- A slow first response on low-RAM hardware is normal; increase the timeout by re-running setup with `--llm-timeout 120`
+
+**No audio output**
+
+- Identify your ALSA device: `aplay -l`
+- Re-run setup with the correct device: `sudo ./setup.sh --speaker-device hw:1,0`
+- Test directly: `aplay -D hw:1,0 /path/to/test.wav`
+
+**faster-whisper download fails behind a proxy**
+
+Set `HTTP_PROXY` / `HTTPS_PROXY` before running `setup.sh`, or manually copy the Whisper model cache to `~/.cache/huggingface/hub/`.
+
+**KDE / powerdevil overrides the power-button setting**
+
+Navigate to *System Settings → Power Management → Advanced Power Settings* and set the power-button action to **Do nothing**.  The script will warn you if powerdevil is detected.
+
+## Uninstall
+
+The script does not provide an automatic uninstall, but the changes it makes are well-defined:
+
+```bash
+# Stop and disable services
+sudo systemctl stop acpid
+sudo systemctl disable acpid          # only if you didn't use acpid before setup
+
+# Remove ACPI event and action files
+sudo rm -f /etc/acpi/events/nuc-voice-assistant /etc/acpi/nuc-voice-assistant.sh
+sudo systemctl restart acpid
+
+# Restore logind power-button handling (prefer the backup written by setup.sh)
+if [ -f /etc/systemd/logind.conf.bak ]; then
+  sudo mv /etc/systemd/logind.conf.bak /etc/systemd/logind.conf
+else
+  sudo sed -i 's/^HandlePowerKey=ignore/HandlePowerKey=poweroff/' /etc/systemd/logind.conf
+fi
+sudo systemctl restart systemd-logind
+
+# Remove sudoers file
+sudo rm -f /etc/sudoers.d/familyman
+
+# Remove autologin config (SDDM)
+sudo rm -f /etc/sddm.conf.d/autologin.conf
+
+# Remove the test command
+sudo rm -f /usr/local/bin/nuc-voice-test
+
+# Remove the voice-assistant working directory
+sudo rm -rf /home/familyman/voice_assistant
+
+# Optionally remove the familyman user
+sudo userdel -r familyman
+
+# Stop and uninstall Ollama (see https://github.com/ollama/ollama for instructions)
+```
 
 ---
 

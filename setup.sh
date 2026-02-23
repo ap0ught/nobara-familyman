@@ -3,6 +3,7 @@
 # Usage:  sudo ./setup.sh [--event 'button/power PBTN 00000080 00000000']
 #                         [--model mistral]  [--record-seconds 5]
 #                         [--mic-device hw:0,0] [--speaker-device hw:0,0]
+#                         [--llm-timeout 60]
 set -euo pipefail
 
 # ─── Defaults ─────────────────────────────────────────────────────────────────
@@ -11,6 +12,7 @@ MODEL_NAME="${MODEL_NAME:-mistral}"
 RECORD_SECONDS="${RECORD_SECONDS:-5}"
 MIC_DEVICE="${MIC_DEVICE:-default}"
 SPEAKER_DEVICE="${SPEAKER_DEVICE:-default}"
+LLM_TIMEOUT="${LLM_TIMEOUT:-60}"
 ACPI_EVENT_MATCH="button/power.*"
 LOGFILE="/var/log/nuc-voice-assistant.log"
 VOICE_DIR=""          # resolved after we know the real user
@@ -18,13 +20,50 @@ PIPER_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_
 PIPER_JSON_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
+_require_arg() {
+  if [[ $# -lt 2 || -z "${2-}" ]]; then
+    echo "Error: $1 requires an argument." >&2
+    echo "Run with --help for usage." >&2
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --event)         ACPI_EVENT_MATCH="$2"; shift 2 ;;
-    --model)         MODEL_NAME="$2"; shift 2 ;;
-    --record-seconds) RECORD_SECONDS="$2"; shift 2 ;;
-    --mic-device)    MIC_DEVICE="$2"; shift 2 ;;
-    --speaker-device) SPEAKER_DEVICE="$2"; shift 2 ;;
+    --event)         _require_arg "$@"; ACPI_EVENT_MATCH="$2"; shift 2 ;;
+    --model)         _require_arg "$@"; MODEL_NAME="$2"; shift 2 ;;
+    --record-seconds) _require_arg "$@"; RECORD_SECONDS="$2"; shift 2 ;;
+    --llm-timeout)   _require_arg "$@"; LLM_TIMEOUT="$2"; shift 2 ;;
+    --mic-device)    _require_arg "$@"; MIC_DEVICE="$2"; shift 2 ;;
+    --speaker-device) _require_arg "$@"; SPEAKER_DEVICE="$2"; shift 2 ;;
+    --help|-h)
+      cat << 'HELPEOF'
+Usage: sudo ./setup.sh [OPTIONS]
+
+Idempotent NUC voice-assistant installer for Nobara HTPC.
+Re-running is safe — all steps are idempotent.
+
+Options:
+  --model NAME           Ollama model to pull and use            (default: mistral)
+  --record-seconds N     Seconds of audio to capture per press   (default: 5, max: 300)
+  --llm-timeout N        Seconds to wait for an LLM response     (default: 60, range: 1-3600)
+  --event 'STRING'       ACPI event match string                 (default: button/power.*)
+  --mic-device DEVICE    ALSA capture device, e.g. hw:1,0        (default: default)
+  --speaker-device DEV   ALSA playback device, e.g. hw:1,0       (default: default)
+  --help, -h             Show this help and exit
+
+Environment variables (override defaults before running):
+  MODEL_NAME, RECORD_SECONDS, LLM_TIMEOUT, MIC_DEVICE, SPEAKER_DEVICE
+  PIPER_VERSION   Piper release tag to download  (default: 2023.11.14-2)
+  PIPER_SHA256    Expected SHA-256 of the Piper tarball (recommended for security)
+
+Examples:
+  sudo ./setup.sh
+  sudo ./setup.sh --model llama3 --record-seconds 8
+  sudo ./setup.sh --event 'button/power PBTN 00000080 00000000'
+  PIPER_VERSION=2023.11.14-2 PIPER_SHA256=<hash> sudo ./setup.sh
+HELPEOF
+      exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -32,6 +71,10 @@ done
 # ─── Input validation ─────────────────────────────────────────────────────────
 if ! [[ "$RECORD_SECONDS" =~ ^[0-9]+$ ]] || [[ "$RECORD_SECONDS" -lt 1 ]] || [[ "$RECORD_SECONDS" -gt 300 ]]; then
   echo "Error: --record-seconds must be a positive integer between 1 and 300." >&2
+  exit 1
+fi
+if ! [[ "$LLM_TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$LLM_TIMEOUT" -lt 1 ]] || [[ "$LLM_TIMEOUT" -gt 3600 ]]; then
+  echo "Error: --llm-timeout must be a positive integer between 1 and 3600." >&2
   exit 1
 fi
 # Allow only safe characters for ALSA device names (alphanumeric, colon, comma, hyphen, dot)
@@ -90,7 +133,11 @@ for grp in wheel audio video; do
   fi
 done
 
-# Passwordless sudo
+# Passwordless sudo — grants familyman full root access for HTPC convenience
+# (e.g. managing the system from the desktop without a password prompt).
+# The ACPI pipeline does NOT require this — acpid runs as root and uses
+# 'sudo -u familyman' directly. See the Security Considerations section of
+# README.md if you prefer a more restricted policy.
 SUDOERS_FILE="/etc/sudoers.d/familyman"
 if [[ ! -f "$SUDOERS_FILE" ]] || ! grep -q "^${HTPC_USER} " "$SUDOERS_FILE" 2>/dev/null; then
   echo "${HTPC_USER} ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
@@ -155,6 +202,7 @@ log "Installing for user: $REAL_USER (home: $REAL_HOME)"
 log "Voice-assistant dir: $VOICE_DIR"
 log "LLM model          : $MODEL_NAME"
 log "Record seconds     : $RECORD_SECONDS"
+log "LLM timeout        : $LLM_TIMEOUT"
 log "ACPI event match   : $ACPI_EVENT_MATCH"
 
 # ─── 1. System dependencies ───────────────────────────────────────────────────
@@ -199,10 +247,26 @@ log "=== Step 2: Ollama ==="
 
 if ! command -v ollama &>/dev/null; then
   log "Downloading and installing Ollama..."
-  # NOTE: This pipes a remote script directly to sh as root — a well-known supply-chain
-  # risk. If you prefer, install ollama from a trusted package source manually, then
+  # NOTE: This executes a remote installer script as root — a well-known supply-chain
+  # risk. If you prefer, install Ollama from a trusted package source manually, then
   # re-run this script. See https://github.com/ollama/ollama for alternatives.
-  curl -fsSL https://ollama.com/install.sh | sh
+  # The script is saved to disk first so you can inspect it before it runs;
+  # set OLLAMA_SHA256=<hash> to verify integrity before execution.
+  OLLAMA_INSTALLER="/tmp/ollama_install.sh"
+  curl -fsSL -o "$OLLAMA_INSTALLER" https://ollama.com/install.sh
+  if [[ -n "${OLLAMA_SHA256:-}" ]]; then
+    echo "${OLLAMA_SHA256}  ${OLLAMA_INSTALLER}" | sha256sum -c - || {
+      rm -f "$OLLAMA_INSTALLER"
+      echo "Error: Ollama installer checksum mismatch. Aborting." >&2
+      exit 1
+    }
+    ok "Ollama installer checksum verified"
+  else
+    warn "OLLAMA_SHA256 not set; skipping installer checksum verification."
+    warn "To verify, inspect $OLLAMA_INSTALLER before proceeding or set OLLAMA_SHA256=<hash>."
+  fi
+  sh "$OLLAMA_INSTALLER"
+  rm -f "$OLLAMA_INSTALLER"
 else
   ok "ollama already installed: $(ollama --version 2>&1 | head -1)"
 fi
@@ -332,6 +396,7 @@ set -euo pipefail
 
 MODEL_NAME="${MODEL_NAME}"
 RECORD_SECONDS="${RECORD_SECONDS}"
+LLM_TIMEOUT="${LLM_TIMEOUT}"
 MIC_DEVICE="${MIC_DEVICE}"
 SPEAKER_DEVICE="${SPEAKER_DEVICE}"
 LOGFILE="${LOGFILE}"
@@ -397,9 +462,9 @@ if [[ -z "\$TRANSCRIPT" ]]; then
 fi
 logit "[voice] Transcript: \$TRANSCRIPT"
 
-# 3. Query Ollama
+# 3. Query Ollama (timeout prevents the pipeline hanging indefinitely)
 logit "[voice] Querying Ollama model: \$MODEL_NAME"
-RESPONSE="\$(ollama run "\$MODEL_NAME" "\$TRANSCRIPT" 2>>\$LOGFILE || echo "I'm sorry, I could not get a response.")"
+RESPONSE="\$(timeout "\$LLM_TIMEOUT" ollama run "\$MODEL_NAME" "\$TRANSCRIPT" 2>>\$LOGFILE || echo "I'm sorry, I could not get a response.")"
 logit "[voice] Response: \$RESPONSE"
 
 # 4. Speak response with Piper + aplay
@@ -533,6 +598,7 @@ set -euo pipefail
 
 HTPC_USER="${REAL_USER}"
 MODEL_NAME="${MODEL_NAME}"
+LLM_TIMEOUT="${LLM_TIMEOUT}"
 LOGFILE="${LOGFILE}"
 VOICE_DIR="${VOICE_DIR}"
 VENV_DIR="${VOICE_DIR}/venv"
@@ -595,7 +661,7 @@ echo -n "  voice model     ... "
 
 # 7. LLM prompt test
 echo "  LLM test prompt ..."
-if RESPONSE="\$(ollama run "\$MODEL_NAME" "Reply only: test OK" 2>/dev/null)" && [[ -n "\$RESPONSE" ]]; then
+if RESPONSE="\$(timeout "\$LLM_TIMEOUT" ollama run "\$MODEL_NAME" "Reply only: test OK" 2>/dev/null)" && [[ -n "\$RESPONSE" ]]; then
   echo "    LLM reply: \$(echo "\$RESPONSE" | head -1) ✓"
 else
   echo "  ✗ LLM test FAILED (empty or error response)"; exit 1
