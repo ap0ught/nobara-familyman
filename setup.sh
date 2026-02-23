@@ -398,6 +398,10 @@ import sys
 
 
 def main() -> None:
+    if len(sys.argv) < 4:
+        print(f"Usage: {sys.argv[0]} <transcript> <model> <out_json_path>", file=sys.stderr)
+        sys.exit(1)
+
     transcript = sys.argv[1]
     model      = sys.argv[2]
     out_path   = sys.argv[3]
@@ -423,6 +427,20 @@ def main() -> None:
         ["ollama", "run", model, prompt],
         capture_output=True, text=True, timeout=30
     )
+    if result.returncode != 0:
+        err_text = (result.stderr or "").strip()
+        if err_text:
+            print(f"ollama run failed with code {result.returncode}: {err_text}", file=sys.stderr)
+        else:
+            print(f"ollama run failed with code {result.returncode} and no stderr output.", file=sys.stderr)
+        intent = json.dumps({
+            "action": "answer",
+            "response": "I could not understand that due to an internal error. Please try again."
+        })
+        with open(out_path, "w") as f:
+            f.write(intent)
+        return
+
     text = result.stdout.strip()
 
     # Extract the first JSON object from the model response
@@ -481,7 +499,8 @@ def kodi_call(url: str, auth: str, method: str, params: dict | None = None) -> d
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
-    except Exception:
+    except Exception as e:
+        print(f"kodi_call error ({method}): {type(e).__name__}: {e}", file=sys.stderr)
         return {}
 
 
@@ -646,21 +665,26 @@ case "\$ACTION" in
     QUERY="\$("\${VENV_DIR}/bin/python3" -c \
       "import sys,json; print(json.loads(sys.argv[1]).get('query',''))" \
       "\$INTENT_JSON" 2>/dev/null || echo "")"
-    logit "[voice] Searching Kodi library for: \$QUERY"
-    PLAY_ITEM="\$("\${VENV_DIR}/bin/python3" "\${VOICE_DIR}/kodi_search.py" \
-      "\$QUERY" \
-      "http://\${KODI_HOST}:\${KODI_PORT}/jsonrpc" \
-      "\${KODI_USER}:\${KODI_PASS}" 2>>\$LOGFILE || echo "")"
-    if [[ -n "\$PLAY_ITEM" ]]; then
-      kodi_rpc "Player.Open" "{\"item\":\${PLAY_ITEM}}" >/dev/null
-      RESPONSE="Playing \${QUERY}"
+    # Require a non-empty query to avoid unintended broad matches
+    if [[ -z "\${QUERY// /}" ]]; then
+      RESPONSE="What would you like me to play?"
     else
-      RESPONSE="I could not find \${QUERY} in your Kodi library."
+      logit "[voice] Searching Kodi library for: \$QUERY"
+      PLAY_ITEM="\$("\${VENV_DIR}/bin/python3" "\${VOICE_DIR}/kodi_search.py" \
+        "\$QUERY" \
+        "http://\${KODI_HOST}:\${KODI_PORT}/jsonrpc" \
+        "\${KODI_USER}:\${KODI_PASS}" 2>>\$LOGFILE || echo "")"
+      if [[ -n "\$PLAY_ITEM" ]]; then
+        kodi_rpc "Player.Open" "{\"item\":\${PLAY_ITEM}}" >/dev/null
+        RESPONSE="Playing \${QUERY}"
+      else
+        RESPONSE="I could not find \${QUERY} in your Kodi library."
+      fi
     fi
     ;;
   pause)
     PID="\$(get_player_id)"
-    [[ -n "\$PID" ]] && kodi_rpc "Player.PlayPause" "{\"playerid\":\${PID}}" >/dev/null
+    [[ -n "\$PID" ]] && kodi_rpc "Player.PlayPause" "{\"playerid\":\${PID},\"play\":false}" >/dev/null
     RESPONSE="\${PID:+Paused}\${PID:-Nothing is playing}"
     ;;
   stop)
@@ -670,7 +694,7 @@ case "\$ACTION" in
     ;;
   resume)
     PID="\$(get_player_id)"
-    [[ -n "\$PID" ]] && kodi_rpc "Player.PlayPause" "{\"playerid\":\${PID}}" >/dev/null
+    [[ -n "\$PID" ]] && kodi_rpc "Player.PlayPause" "{\"playerid\":\${PID},\"play\":true}" >/dev/null
     RESPONSE="\${PID:+Resumed}\${PID:-Nothing is playing}"
     ;;
   next)
@@ -685,7 +709,7 @@ case "\$ACTION" in
     ;;
   volume)
     LEVEL="\$("\${VENV_DIR}/bin/python3" -c \
-      "import sys,json; print(int(json.loads(sys.argv[1]).get('level',50)))" \
+      "import sys,json; v=json.loads(sys.argv[1]).get('level',50); print(max(0,min(100,int(v))))" \
       "\$INTENT_JSON" 2>/dev/null || echo "50")"
     kodi_rpc "Application.SetVolume" "{\"volume\":\${LEVEL}}" >/dev/null
     RESPONSE="Volume set to \${LEVEL} percent"
@@ -1105,6 +1129,7 @@ fi
 USERDATA_DIR="$STEAM_ROOT/userdata"
 SHORTCUTS_VDF=""
 for uid_dir in "$USERDATA_DIR"/*/; do
+  uid_dir="${uid_dir%/}"   # strip trailing slash so ##*/ extracts the basename
   candidate="$uid_dir/config/shortcuts.vdf"
   if [[ -d "$uid_dir" ]] && [[ "${uid_dir##*/}" =~ ^[0-9]+$ ]]; then
     SHORTCUTS_VDF="$candidate"
@@ -1236,7 +1261,7 @@ SHORTCUTS_EOF
 
 chmod 755 "$ADD_SHORTCUTS_CMD"
 ok "Created $ADD_SHORTCUTS_CMD"
-ok "Run 'htpc-add-steam-shortcuts' after launching Steam once to add HTPC apps to the Game Pad UI"
+ok "Run 'htpc-add-steam-shortcuts' after launching Steam once to add HTPC apps to the Gamepad UI"
 
 # ─── 14. Verification summary ─────────────────────────────────────────────────
 cat << SUMMARY
