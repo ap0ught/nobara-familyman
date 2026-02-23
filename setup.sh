@@ -500,12 +500,17 @@ fi
 
 logit "[acpi] Launching voice_trigger.sh as \$REAL_USER"
 export XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR"
-# Run in background so acpid is not blocked; logging is fully redirected.
+# Run in background so acpid returns immediately (pipeline takes 10-30 s).
+# The child is reparented to PID 1 (systemd) when this script exits — this is
+# intentional and correct. Output is fully redirected to the log file.
 sudo -u "\$REAL_USER" \
   XDG_RUNTIME_DIR="\$XDG_RUNTIME_DIR" \
   "\$VOICE_DIR/voice_trigger.sh" >> "\$LOGFILE" 2>&1 &
+PIPELINE_PID=\$!
 
-logit "[acpi] voice_trigger.sh launched (PID \$!)"
+# Save PID so it can be inspected if needed (e.g. kill a runaway pipeline)
+echo "\$PIPELINE_PID" > /run/nuc-voice-assistant.pid
+logit "[acpi] voice_trigger.sh launched (PID \$PIPELINE_PID)"
 ACTIONEOF
 
 chmod 755 "$ACPI_ACTION"
@@ -521,8 +526,12 @@ TEST_CMD="/usr/local/bin/nuc-voice-test"
 cat > "$TEST_CMD" << TESTEOF
 #!/usr/bin/env bash
 # nuc-voice-test — verify voice assistant components
+# Service checks (ollama, acpid) are done as-is; pipeline checks are always
+# run as the real HTPC user (${REAL_USER}) to match the voice assistant's
+# actual runtime environment.
 set -euo pipefail
 
+HTPC_USER="${REAL_USER}"
 MODEL_NAME="${MODEL_NAME}"
 LOGFILE="${LOGFILE}"
 VOICE_DIR="${VOICE_DIR}"
@@ -531,13 +540,15 @@ PIPER_BIN="${PIPER_BIN}"
 VOICE_MODEL="${VOICES_DIR}/en_US-lessac-medium.onnx"
 SPEAKER_DEVICE="${SPEAKER_DEVICE}"
 
-OUT_WAV="/tmp/nuc_voice_test.wav"
+OUT_WAV="\${VOICE_DIR}/tmp/nuc_voice_test.wav"
 TEST_PHRASE="Voice assistant test successful."
 
 ts() { date '+%Y-%m-%dT%H:%M:%S'; }
 logit() { echo "\$(ts) \$*" | tee -a "\$LOGFILE"; }
 
 echo "=== NUC Voice Assistant — Self Test ==="
+
+# ── Service checks (safe to run as root or user) ────────────────────────────
 
 # 1. ollama
 echo -n "  ollama version ... "
@@ -557,6 +568,13 @@ if systemctl is-active --quiet acpid 2>/dev/null; then
   echo "running ✓"
 else
   echo "NOT running ✗"; exit 1
+fi
+
+# ── Pipeline checks — re-exec as HTPC_USER if currently root ───────────────
+# This ensures we test the exact environment the voice assistant uses.
+if [[ \$EUID -eq 0 ]] && [[ "\$(whoami)" != "\$HTPC_USER" ]]; then
+  echo "  (re-running pipeline checks as \$HTPC_USER...)"
+  exec sudo -u "\$HTPC_USER" "\$0" --pipeline-only
 fi
 
 # 4. faster-whisper importable
@@ -585,16 +603,25 @@ fi
 
 # 8. TTS + playback test
 echo "  TTS test ..."
+mkdir -p "\$(dirname "\$OUT_WAV")" && chmod 700 "\$(dirname "\$OUT_WAV")"
 echo "\$TEST_PHRASE" | "\$PIPER_BIN" --model "\$VOICE_MODEL" --output_file "\$OUT_WAV" 2>/dev/null
 if [[ "\$SPEAKER_DEVICE" == "default" ]]; then
   aplay "\$OUT_WAV" 2>/dev/null && echo "  ✓ Audio played OK"
 else
   aplay -D "\$SPEAKER_DEVICE" "\$OUT_WAV" 2>/dev/null && echo "  ✓ Audio played OK"
 fi
+rm -f "\$OUT_WAV"
 
-logit "[test] nuc-voice-test ran successfully"
+# Only log "success" from the final user context (not the root wrapper)
+if [[ \$EUID -ne 0 ]]; then
+  logit "[test] nuc-voice-test ran successfully"
+fi
 echo ""
 echo "=== All checks passed ==="
+
+# Support --pipeline-only flag used when re-exec-ed as HTPC_USER
+[[ "\${1:-}" == "--pipeline-only" ]] && exit 0
+true
 TESTEOF
 
 chmod 755 "$TEST_CMD"
